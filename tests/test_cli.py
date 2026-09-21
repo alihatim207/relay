@@ -14,6 +14,7 @@ developer's real runs.
 from __future__ import annotations
 
 import json
+import sys
 import textwrap
 from pathlib import Path
 
@@ -1096,11 +1097,20 @@ def fake_ssh(monkeypatch):
     module-level functions precisely so this fixture can replace them; nothing
     here opens a socket, reads ~/.ssh/config or waits for a Duo prompt.
     """
-    calls: dict = {"argv": None, "exit_code": 0, "alive": True, "checked": []}
+    calls: dict = {
+        "argv": None,
+        "exit_code": 0,
+        "stderr": "",
+        "alive": True,
+        "checked": [],
+    }
 
     def run(argv):
         calls["argv"] = argv
-        return calls["exit_code"]
+        # `_run_interactive` tees ssh's stderr: it shows the user every line as
+        # ssh prints it *and* hands the text back, so relay can quote ssh's own
+        # explanation instead of guessing. Hence the tuple.
+        return calls["exit_code"], calls["stderr"]
 
     def alive(alias):
         calls["checked"].append(alias)
@@ -1155,6 +1165,99 @@ def test_connect_failing_ssh_exits_transport(capsys, fake_ssh):
     assert "klone" in captured.err
     assert "Traceback" not in captured.err
     assert captured.out == ""
+
+
+def test_connect_quotes_sshs_own_reason_instead_of_guessing(capsys, fake_ssh):
+    """The failure that started all this: Duo succeeded, then ssh could not
+    bind the control socket because ~/.relay did not exist. relay's old message
+    told the user to check that plain `ssh klone` works -- the one thing that
+    was demonstrably fine.
+
+    Limitation, stated plainly: this fixture never runs ssh, so this test could
+    not have caught the missing-directory bug itself. It pins the *shape of the
+    message*, nothing more. Another test covers the real `ssh` path.
+    """
+    write_config(SLURM_CONFIG)
+    fake_ssh["exit_code"] = 255
+    fake_ssh["stderr"] = (
+        "unix_listener: cannot bind to path /x/.relay/cm-abc.123: "
+        "No such file or directory\n"
+    )
+
+    code = cli.main(["connect"])
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_TRANSPORT
+    assert (
+        "unix_listener: cannot bind to path /x/.relay/cm-abc.123: "
+        "No such file or directory" in err
+    )
+    assert "plain" not in err
+    assert "Check that plain" not in err
+
+
+def test_connect_falls_back_to_advice_only_when_ssh_said_nothing(capsys, fake_ssh):
+    """No stderr to quote, so the old suggestion is the best relay has.
+
+    Same limitation as above: no real ssh runs here, only the message shape.
+    """
+    write_config(SLURM_CONFIG)
+    fake_ssh["exit_code"] = 255
+    fake_ssh["stderr"] = ""
+
+    code = cli.main(["connect"])
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_TRANSPORT
+    assert "Check that plain `ssh klone` works" in err
+
+
+def test_connect_quotes_the_last_stderr_line_not_the_first(capsys, fake_ssh):
+    """ssh prints banners and warnings first; the reason it failed comes last.
+
+    Same limitation as above: no real ssh runs here, only the message shape.
+    """
+    write_config(SLURM_CONFIG)
+    fake_ssh["exit_code"] = 255
+    fake_ssh["stderr"] = (
+        "Warning: Permanently added 'klone' to the list of known hosts.\n"
+        "debug1: Entering interactive session.\n"
+        "unix_listener: cannot bind to path /x/.relay/cm-abc.123: "
+        "No such file or directory\n"
+        "\n"
+    )
+
+    assert cli.main(["connect"]) == cli.EXIT_TRANSPORT
+    err = capsys.readouterr().err
+    # The ConnectFailed sentence quotes the last non-blank line...
+    assert "ssh exited 255 while opening a connection to klone: unix_listener" in err
+    # ...and not the banner, which is what `_first_line` would have picked.
+    assert "Permanently added" not in err.split("ssh exited 255")[-1]
+
+
+def test_run_interactive_tees_stderr_to_the_terminal_and_back(capfd):
+    """The real seam, with a real child process: every stderr line must reach
+    the terminal (so a Duo prompt is visible as it is written) *and* come back
+    to relay (so relay can quote ssh in its own error).
+
+    capfd rather than capsys because a child process writes to fd 2; relay's
+    parent-side rewrite goes through `sys.stderr`, and capfd sees both.
+    """
+    code, err = cli._run_interactive(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('warn1', file=sys.stderr); "
+            "print('warn2', file=sys.stderr); sys.exit(255)",
+        ]
+    )
+
+    assert code == 255
+    # Returned to the caller...
+    assert "warn1" in err
+    assert "warn2" in err
+    # ...and also written out where the user can see it.
+    captured = capfd.readouterr().err
+    assert "warn1" in captured
+    assert "warn2" in captured
 
 
 def test_connect_without_a_live_master_afterwards_exits_transport(capsys, fake_ssh):

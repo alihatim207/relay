@@ -17,17 +17,186 @@ present" would not notice either going missing.
 hands it to ssh untouched, so the user's own config supplies the username,
 hostname, key and jump host. A `user@host` sneaking in here would defeat the
 whole arrangement, so the builders refuse one outright.
+
+**The ControlPath directory has to exist before ssh runs.** This one is here
+because it went wrong in production. The first real run on Klone got all the
+way through Duo and then died with
+
+    unix_listener: cannot bind to path /Users/.../.relay/cm-<hash>.<random>:
+    No such file or directory
+
+because nothing had ever created `~/.relay`. ssh does not create the parent
+directory of a ControlPath, and it only finds out it cannot bind *after*
+authenticating -- the worst possible moment to fail.
+
+Say plainly why the rest of this suite could not have caught it: every other
+test here, and every backend test, hands the argv to a *fake* runner and
+asserts on the list of words. The bind happens inside the real `ssh` binary,
+which a fake never runs, so an argv can be perfectly correct and still fail
+the moment a real process tries to use it. No amount of argv assertions
+reaches that. The tests below pin the other half of the contract -- the
+directory invariant, that any argv relay builds has created `~/.relay`
+first -- and `tests/test_ssh_integration.py` runs one real ssh against
+localhost (skipped where there is no sshd) to exercise the socket itself.
 """
 
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from relay import ssh
 
 ALIAS = "klone"
+
+
+# --------------------------------------------------------------------------
+# ensure_control_dir
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point HOME at a fresh empty directory for every test in this file.
+
+    `os.path.expanduser("~")` reads the HOME environment variable on POSIX, so
+    this is the whole redirect: `ssh.relay_dir()` resolves under `tmp_path`
+    instead of the developer's real home directory.
+
+    Autouse, because the argv builders now have a side effect. Every test that
+    calls `build_ssh_argv`, `connect_argv` or `master_check_argv` -- which is
+    most of this file -- would otherwise create the real `~/.relay` just by
+    running. Tests should not leave anything behind in a home directory.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path
+
+
+def test_relay_dir_follows_home(home: Path):
+    """Proves the redirect above actually works, once, for the whole file.
+
+    If this fails, every other assertion about `tmp_path / ".relay"` is really
+    an assertion about the real `~/.relay` and means nothing.
+    """
+    assert ssh.relay_dir() == home / ".relay"
+
+
+def test_ensure_control_dir_creates_the_directory_when_it_is_absent(home: Path):
+    """The actual production bug: nothing had ever created `~/.relay`.
+
+    A fake-runner test cannot catch this, because the failure happens when the
+    real ssh binary tries to bind a socket inside a directory that is not
+    there. Here we check the directory itself instead.
+    """
+    control_dir = home / ".relay"
+    assert not control_dir.exists()
+
+    returned = ssh.ensure_control_dir()
+
+    assert returned == control_dir
+    assert control_dir.is_dir()
+    # 0700, not 0755: anyone who can connect to the control socket can run
+    # commands on the cluster as this user, through an already-authenticated
+    # master. That is the whole security boundary of multiplexing.
+    assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700
+
+
+def test_ensure_control_dir_tightens_a_directory_that_is_too_open(home: Path):
+    """`mkdir(mode=...)` only applies to a directory it creates.
+
+    A `~/.relay` left over from an older relay, or made by hand under a loose
+    umask, would keep its permissive mode forever if we only ever passed a mode
+    to makedirs. So the mode is asserted and corrected on every call.
+    """
+    control_dir = home / ".relay"
+    control_dir.mkdir(mode=0o755)
+    os.chmod(control_dir, 0o755)  # defeat any umask applied by mkdir
+    assert stat.S_IMODE(control_dir.stat().st_mode) == 0o755
+
+    returned = ssh.ensure_control_dir()
+
+    assert returned == control_dir
+    assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700
+
+
+def test_ensure_control_dir_leaves_an_already_correct_directory_alone(home: Path):
+    """The common case, on every single ssh invocation: do nothing, quietly.
+
+    Same reasoning as above -- a fake runner never exercises this path -- but
+    the cost of getting it wrong is different: this runs before *every* ssh
+    relay makes, so it must be idempotent and must not disturb anything already
+    living in the directory, least of all a live control socket.
+    """
+    control_dir = home / ".relay"
+    control_dir.mkdir(mode=0o700)
+    os.chmod(control_dir, 0o700)
+    before = control_dir.stat()
+    (control_dir / "cm-pretend-socket").write_text("")
+
+    returned = ssh.ensure_control_dir()
+
+    assert returned == control_dir
+    assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700
+    assert control_dir.stat().st_ino == before.st_ino, "the directory was replaced"
+    assert (control_dir / "cm-pretend-socket").exists(), "existing sockets survive"
+
+
+def test_ensure_control_dir_refuses_a_regular_file_in_the_way(home: Path):
+    """A file at `~/.relay` must fail loudly, naming the path.
+
+    Carrying on would mean every ssh invocation dying inside the ssh binary
+    with the same cryptic `unix_listener` message the fix exists to prevent --
+    and again, only when a *real* ssh runs, which no fake-runner test would
+    ever reveal. The error has to say which path to move out of the way.
+
+    `os.makedirs(..., exist_ok=True)` raises `FileExistsError` for a file in
+    the way (exist_ok only forgives an existing directory), which
+    `ensure_control_dir` catches so that both shapes of "something is there"
+    end in the same `NotADirectoryError` and the same sentence.
+    """
+    blocker = home / ".relay"
+    blocker.write_text("not a directory")
+
+    with pytest.raises(NotADirectoryError) as excinfo:
+        ssh.ensure_control_dir()
+
+    assert str(blocker) in str(excinfo.value)
+    assert "move the file out of the way" in str(excinfo.value)
+    assert blocker.is_file(), "the file must be left alone, not silently removed"
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        pytest.param(lambda: ssh.build_ssh_argv(ALIAS, ["true"]), id="build_ssh_argv"),
+        pytest.param(lambda: ssh.connect_argv(ALIAS), id="connect_argv"),
+        pytest.param(lambda: ssh.master_check_argv(ALIAS), id="master_check_argv"),
+    ],
+)
+def test_every_builder_creates_the_control_directory(builder, home: Path):
+    """Building *any* relay ssh argv creates `~/.relay` first.
+
+    This is the invariant that makes the fix complete. Putting the directory
+    creation only in `relay connect` would leave the daemon and `doctor`
+    broken, since either can run on a machine where `connect` never has -- and
+    `master_check_argv` does not go through `_common_options`, so it needs its
+    own call. Each case gets a fresh HOME (a new `tmp_path` per parametrised
+    run), so "it was already there from the last test" cannot hide a miss.
+
+    A FakeRunner test could not have caught the bug this guards: it asserts on
+    words in a list, while the failure happens when a real ssh binds a socket.
+    """
+    control_dir = home / ".relay"
+    assert not control_dir.exists(), "each parametrised case needs a fresh HOME"
+
+    builder()
+
+    assert control_dir.is_dir()
+    assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700
 
 
 # --------------------------------------------------------------------------

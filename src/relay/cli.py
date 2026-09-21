@@ -1231,16 +1231,62 @@ def cmd_usage(args) -> Output:
 # --------------------------------------------------------------------------
 
 
-def _run_interactive(argv: list[str]) -> int:
-    """Run a command with relay's own terminal attached, and return its code.
+def _last_nonblank_line(text: str) -> str:
+    """The last non-blank line of `text`, stripped, or "" if there is none.
 
-    Deliberately *not* captured. Duo writes its prompt to the terminal and
-    reads the answer back from it, so a captured `relay connect` would look
-    like a command that hangs for no reason. This is a module-level function
-    with one line in it so that a test can replace it without going anywhere
-    near a real ssh.
+    ssh prints its banners and warnings first and the sentence that actually
+    explains the failure last, so the *last* line is the one worth quoting.
+
+    A four-line copy of `slurm._last_line` rather than an import: `cli.py`
+    deliberately imports the Slurm backend lazily, inside the functions that
+    need it, so that `relay ls` on a laptop with no cluster does not pull in
+    the SSH backend.
     """
-    return subprocess.run(argv).returncode
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _run_interactive(argv: list[str]) -> tuple[int, str]:
+    """Run ssh with relay's terminal attached. Returns (exit code, its stderr).
+
+    Two requirements pull in opposite directions here, so this *tees* stderr
+    rather than choosing one of them:
+
+      * The user must see ssh in real time. Duo's prompt text and every ssh
+        warning go to stderr, and ssh reads the answer from /dev/tty. Capturing
+        stderr silently (`capture_output=True`) would turn `relay connect` into
+        a command that hangs for no visible reason while a prompt sits unread
+        in a buffer.
+
+      * relay needs the text for its own error message. Plain inheritance --
+        the old one-liner -- printed everything and kept nothing, so when ssh
+        failed all relay could say was "check that plain `ssh klone` works",
+        even when ssh had just explained the real reason on the line above.
+
+    So stdin and stdout stay inherited, stderr is piped, and every line read
+    off that pipe is written straight through to `sys.stderr` and flushed
+    *before* the next read. The user sees each line as ssh prints it, and relay
+    still has the whole thing when the process exits.
+
+    Still a module-level function so a test can replace it without going
+    anywhere near a real ssh.
+    """
+    # text=True gives us str lines; stdin and stdout are left alone so ssh keeps
+    # the terminal it needs.
+    proc = subprocess.Popen(argv, stderr=subprocess.PIPE, text=True)
+    captured: list[str] = []
+    # Iterating the pipe yields one line at a time as ssh writes it, which is
+    # what keeps the prompt live rather than arriving all at once at the end.
+    assert proc.stderr is not None  # stderr=PIPE guarantees this
+    for line in proc.stderr:
+        captured.append(line)
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    proc.stderr.close()
+    return proc.wait(), "".join(captured)
 
 
 def _master_alive(alias: str) -> bool:
@@ -1280,8 +1326,20 @@ def cmd_connect(args) -> Output:
             f"~/.ssh/config."
         )
 
-    code = _run_interactive(ssh_module.connect_argv(alias))
+    code, err = _run_interactive(ssh_module.connect_argv(alias))
     if code != 0:
+        # ssh has already told the user what went wrong -- it went past on the
+        # terminal a moment ago -- so relay repeats that line rather than
+        # guessing. The first real run on Klone failed with "unix_listener:
+        # cannot bind to path ...: No such file or directory" *after* Duo had
+        # succeeded, while relay advised checking that plain `ssh klone` works.
+        # That advice sent the user to look at the one thing that was fine.
+        detail = _last_nonblank_line(err)
+        if detail:
+            raise ConnectFailed(
+                f"ssh exited {code} while opening a connection to {alias}: "
+                f"{detail}. Run `relay connect` again once that is fixed."
+            )
         raise ConnectFailed(
             f"ssh exited {code} while opening a connection to {alias}, so relay "
             f"has no control master. Check that plain `ssh {alias}` works, then "

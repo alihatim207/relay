@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- `relay connect` failed after Duo with `unix_listener: cannot bind to path ~/.relay/...: No such file or directory`: the ControlPath directory was never created. Every ssh argv builder now ensures `~/.relay` exists with mode 0700 (and corrects a looser mode), so connect, the daemon, doctor, and the backend are all covered. `doctor` gained a `control_dir` check. ssh exit-255 errors now quote ssh's last stderr line instead of always suggesting "check that plain ssh works".
+
+### Added
+
+- Two optional resume paths after preemption: config-driven (`resume.checkpoint_glob` + `resume.arg`) and the `relay_ckpt` helper module.
+- `setup` shell lines and `sbatch_extra` directives in config and on `relay submit`; `slurm.gres`. `sbatch_defaults` removed in favour of `sbatch_extra`.
+
 ### Spec change round 1
 
 - **Signal semantics fixed.** SIGTERM no longer means "requeue": `scancel` sends the same signal, so a cancelled run could come back. Time-limit warnings now arrive as SIGUSR1 (`--signal=B:USR1@<grace>`) and self-requeue; SIGTERM ends the attempt as `interrupted` and requeues only per `requeue_on_term` and the absence of `CANCEL_REQUESTED`. `relay cancel` writes that file before `scancel`.

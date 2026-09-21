@@ -620,6 +620,23 @@ def _first_line(text: str) -> str:
     return ""
 
 
+def _last_line(text: str) -> str:
+    """The last non-blank line of `text`, for putting inside an error sentence.
+
+    ssh's own failures belong at the *end* of its stderr, not the start. A
+    connection that dies during setup prints banners, "debug1" chatter or
+    warnings first and the sentence that actually explains the failure last --
+    for example `unix_listener: cannot bind to path ...: No such file or
+    directory`, which arrives after authentication has already succeeded. Using
+    `_first_line` there would quote the least useful line ssh printed.
+    """
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
 # --------------------------------------------------------------------------
 # Rendering the sbatch script
 # --------------------------------------------------------------------------
@@ -997,11 +1014,27 @@ class SlurmBackend(Backend):
 
         if returncode == SSH_FAILURE_RETURNCODE:
             err = _decode(stderr)
-            detail = _first_line(err) or "ssh exited 255"
+            # ssh almost always says why it failed, and its own explanation is
+            # far more useful than any guess relay can make. The first real run
+            # on Klone failed with "unix_listener: cannot bind to path ...: No
+            # such file or directory" while relay reported "check that plain
+            # `ssh klone` works" -- advice that was not just useless but
+            # actively wrong, because authentication had already succeeded.
+            # So: quote ssh, and only fall back to advice when it said nothing.
+            detail = _last_line(err)
+            if detail:
+                message = (
+                    f"Could not reach {self.ssh_alias}: {detail}. "
+                    f"Run `relay connect` if the SSH master is down."
+                )
+            else:
+                message = (
+                    f"Could not reach {self.ssh_alias}: ssh exited 255 with no "
+                    f"message. Check that `ssh {self.ssh_alias}` works from this "
+                    f"machine, and run `relay connect` if it needs a Duo prompt."
+                )
             raise TransportError(
-                f"Could not reach {self.ssh_alias}: {detail}. Check that "
-                f"`ssh {self.ssh_alias}` works from this machine, and run "
-                f"`relay connect` if it needs a Duo prompt.",
+                message,
                 returncode=returncode,
                 stderr=err,
             )

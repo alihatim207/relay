@@ -50,6 +50,7 @@ import fcntl
 import re
 import shlex
 import sqlite3
+import stat
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -302,6 +303,21 @@ def _first_line(text: str) -> str:
     return ""
 
 
+def _last_line(text: str) -> str:
+    """The last non-blank line of some output.
+
+    ssh prints its own diagnostics *after* the ones from the connection it was
+    setting up, so when ssh itself fails (exit 255) the sentence that says why
+    is usually the last line, not the first. `_first_line` is still right for a
+    remote command's own error output, which is why both exist.
+    """
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
 def _skipped(name: str, reason: str) -> CheckResult:
     """A check that did not run, and the sentence explaining why."""
     return CheckResult(name=name, status=SKIP, detail=f"Skipped: {reason}.")
@@ -486,6 +502,93 @@ def _check_config(path: Path | None) -> tuple[cfg.Config | None, CheckResult]:
 
 
 # --------------------------------------------------------------------------
+# Check 2: the directory relay's control socket lives in
+# --------------------------------------------------------------------------
+
+
+def _check_control_dir(conf: cfg.Config, ctx: _Context) -> CheckResult:
+    """Does `~/.relay/` exist, as a directory, with mode 0700?
+
+    This is the check the first real Klone run needed and did not have. ssh
+    does not create the parent directory of its ControlPath. If `~/.relay/` is
+    missing, ssh authenticates -- Duo push, phone tap, the lot -- and only
+    *then* fails with "unix_listener: cannot bind to path ...: No such file or
+    directory". Every relay command that touches the cluster failed that way,
+    after the most annoying possible delay.
+
+    `ssh.ensure_control_dir()` now fixes that at the source: every argv builder
+    calls it, so any ssh relay runs has the directory in place first. This check
+    exists anyway for two reasons. It runs *before* the master check, which is
+    the first thing in doctor that would build an ssh argv, so it reports the
+    state the user actually had rather than the state the repair left behind.
+    And it is the only place that tells the user the directory was missing or
+    world-readable at all, which is the difference between "relay fixed
+    something for you" and silence.
+
+    Mode matters as much as existence: anyone who can connect to relay's
+    control socket can run commands on the cluster as the user, with no
+    authentication of their own, because the socket *is* an authenticated
+    session. That is a warning rather than an ok even though relay corrects it,
+    because a permission that was wrong once was set by something, and the user
+    should know.
+    """
+    path = ssh_mod.relay_dir()
+
+    # Look before touching. `ensure_control_dir()` is deliberately idempotent
+    # and silent, so after it runs there is no way to tell what it had to do.
+    existed = path.exists() or path.is_symlink()
+    was_dir = path.is_dir()
+    mode_before: int | None = None
+    if existed:
+        try:
+            mode_before = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            mode_before = None
+
+    try:
+        ssh_mod.ensure_control_dir()
+    except NotADirectoryError as exc:
+        # ensure_control_dir()'s own sentence already says what to do.
+        return CheckResult("control_dir", ERROR, str(exc))
+    except OSError as exc:
+        if existed and not was_dir:
+            # `os.makedirs` reports a plain file in the way as FileExistsError
+            # rather than NotADirectoryError, so say the useful thing here too.
+            return CheckResult(
+                "control_dir",
+                ERROR,
+                f"{path} exists but is not a directory. relay keeps its SSH "
+                f"control socket there; move the file out of the way and "
+                f"re-run `relay doctor`.",
+            )
+        reason = exc.strerror or str(exc)
+        return CheckResult(
+            "control_dir",
+            ERROR,
+            f"cannot create {path}: {reason}. relay's SSH control socket lives "
+            f"there, and ssh fails after you have already answered Duo if it is "
+            f"missing.",
+        )
+
+    if not existed:
+        return CheckResult(
+            "control_dir",
+            OK,
+            f"created {path} with mode 0700 (ssh does not create it, and fails "
+            f"after Duo if it is missing).",
+        )
+    if mode_before == 0o700:
+        return CheckResult("control_dir", OK, f"{path} exists with mode 0700.")
+    shown = "unknown" if mode_before is None else f"{mode_before:04o}"
+    return CheckResult(
+        "control_dir",
+        WARN,
+        f"{path} had mode {shown}; corrected to 0700 (a control socket other "
+        f"users can reach lets them run commands as you).",
+    )
+
+
+# --------------------------------------------------------------------------
 # Check 2: relay's own SSH master
 # --------------------------------------------------------------------------
 
@@ -581,10 +684,19 @@ def _check_ssh(conf: cfg.Config, ctx: _Context) -> CheckResult:
             result.duration_ms,
         )
     if result.returncode != 0:
+        # 255 is ssh's own "I failed" code rather than the remote command's
+        # exit status, and ssh prints its reason last -- after whatever the
+        # connection attempt itself said. Quoting that line is the difference
+        # between "exited 255" and "unix_listener: cannot bind to path
+        # /Users/you/.relay/cm-abc: No such file or directory", which names the
+        # actual problem.
+        detail = result.message()
+        if result.returncode == 255:
+            detail = _last_line(result.stderr) or detail
         return CheckResult(
             "ssh",
             ERROR,
-            f"`ssh {alias} true` exited {result.returncode}: {result.message()}. "
+            f"`ssh {alias} true` exited {result.returncode}: {detail}. "
             f"Fix the connection by hand, then re-run `relay doctor`.{hint}",
             result.duration_ms,
         )
@@ -1423,8 +1535,13 @@ def _check_last_sync() -> CheckResult:
 # hand-written call sites means the "skip everything remote" path below cannot
 # forget one.
 _REMOTE_CHECKS: tuple[tuple[str, object], ...] = (
-    # `master` goes first on purpose: it costs nothing (a local socket probe),
-    # and knowing the answer lets every check after it name the right cause.
+    # `control_dir` goes first because it is the only check that must run
+    # before anything builds an ssh argv: every builder calls
+    # `ensure_control_dir()`, so a check placed later would always find the
+    # directory already repaired and report a problem the user never sees.
+    ("control_dir", _check_control_dir),
+    # `master` next: it costs nothing (a local socket probe), and knowing the
+    # answer lets every check after it name the right cause.
     ("master", _check_master),
     ("ssh", _check_ssh),
     ("remote_python", _check_remote_python),

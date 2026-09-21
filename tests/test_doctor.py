@@ -19,6 +19,8 @@ would overwrite) the developer's real state.
 from __future__ import annotations
 
 import fcntl
+import os
+import stat
 import textwrap
 from pathlib import Path
 
@@ -205,6 +207,7 @@ def by_name(results: list[doctor.CheckResult]) -> dict[str, doctor.CheckResult]:
 
 ALL_CHECK_NAMES = [
     "config",
+    "control_dir",
     "master",
     "ssh",
     "remote_python",
@@ -222,6 +225,7 @@ ALL_CHECK_NAMES = [
 ]
 
 REMOTE_CHECK_NAMES = [
+    "control_dir",
     "master",
     "ssh",
     "remote_python",
@@ -476,6 +480,165 @@ def test_ssh_nonzero_exit_is_an_error(monkeypatch):
 
     assert checks["ssh"].status == doctor.ERROR
     assert "Permission denied" in checks["ssh"].detail
+
+
+def test_ssh_255_quotes_the_last_line_of_stderr(monkeypatch):
+    """Exit 255 is ssh's own failure, and ssh prints its reason last.
+
+    The first lines belong to the connection attempt ("Authenticated to ...");
+    the line that names the problem comes after them. Reporting only the first
+    line, or only "exited 255", hides the one sentence that would have told the
+    user what was wrong.
+    """
+    write_slurm_config()
+    table = healthy_ssh_table()
+    table["true"] = ssh_rc(
+        255,
+        stderr=(
+            "debug1: Connecting to klone-login03.hyak.local port 22.\n"
+            "Authenticated to klone-login03 using \"keyboard-interactive\".\n"
+            "unix_listener: cannot bind to path /home/you/.relay/cm-9f2a: "
+            "No such file or directory\n"
+        ),
+    )
+    install_ssh(monkeypatch, table)
+
+    result = by_name(doctor.run_checks())["ssh"]
+
+    assert result.status == doctor.ERROR
+    assert "unix_listener: cannot bind" in result.detail
+    assert "Authenticated to" not in result.detail
+
+
+# --------------------------------------------------------------------------
+# Check 2: the ControlPath directory
+# --------------------------------------------------------------------------
+#
+# Why this check exists, given that `ssh.ensure_control_dir()` already fixes
+# the problem: no test in this file has ever run the real ssh binary (the
+# autouse `no_real_ssh` fixture sees to that), and the original bug --
+# "unix_listener: cannot bind to path ~/.relay/cm-...: No such file or
+# directory" -- happens *inside* that binary, at socket-bind time, after Duo
+# has already been answered. A stubbed `_ssh` seam could never have caught it,
+# and neither could any assertion about the argv, because the argv was correct.
+# So these tests are not really "does the fix work"; they are "does doctor tell
+# the user, before a Duo push is spent finding out".
+
+
+def mode_of(path: Path) -> int:
+    """The permission bits of a path, without the file-type bits."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_relay_dir_resolves_inside_the_test_home(isolated_home):
+    """Guard for every test below: `~` must expand to the throwaway HOME.
+
+    `os.path.expanduser` reads $HOME on POSIX, which the autouse fixture has
+    redirected -- so `ssh.relay_dir()` points into tmp_path and a test that
+    creates it cannot touch the developer's real `~/.relay`.
+    """
+    assert ssh_mod.relay_dir() == isolated_home / ".relay"
+
+
+def test_missing_control_dir_is_created_and_reported(monkeypatch, isolated_home):
+    write_slurm_config()
+    install_ssh(monkeypatch, healthy_ssh_table())
+    relay_dir = isolated_home / ".relay"
+    assert not relay_dir.exists()
+
+    result = by_name(doctor.run_checks())["control_dir"]
+
+    assert result.status == doctor.OK
+    assert "created" in result.detail
+    assert str(relay_dir) in result.detail
+    # The sentence has to say why it mattered, or "created a directory" reads
+    # like noise rather than the thing that broke the first real run.
+    assert "Duo" in result.detail
+    assert relay_dir.is_dir()
+    assert mode_of(relay_dir) == 0o700
+
+
+def test_loose_control_dir_is_corrected_and_warned_about(monkeypatch, isolated_home):
+    """0755 is a warning, not an ok: relay fixed it, but it was wrong."""
+    write_slurm_config()
+    install_ssh(monkeypatch, healthy_ssh_table())
+    relay_dir = isolated_home / ".relay"
+    relay_dir.mkdir()
+    os.chmod(relay_dir, 0o755)  # mkdir(mode=) is masked by the umask; this is not
+
+    result = by_name(doctor.run_checks())["control_dir"]
+
+    assert result.status == doctor.WARN
+    assert "0755" in result.detail
+    assert "corrected" in result.detail
+    assert mode_of(relay_dir) == 0o700
+    # A warning must not fail the run as a whole.
+    assert doctor.worst_status([result]) == 0
+
+
+def test_correct_control_dir_is_left_alone(monkeypatch, isolated_home):
+    write_slurm_config()
+    install_ssh(monkeypatch, healthy_ssh_table())
+    relay_dir = isolated_home / ".relay"
+    relay_dir.mkdir()
+    os.chmod(relay_dir, 0o700)
+    before = relay_dir.stat().st_mtime
+
+    result = by_name(doctor.run_checks())["control_dir"]
+
+    assert result.status == doctor.OK
+    assert "exists with mode 0700" in result.detail
+    assert "created" not in result.detail
+    assert mode_of(relay_dir) == 0o700
+    assert relay_dir.stat().st_mtime == before
+
+
+def test_a_file_where_the_control_dir_belongs_is_an_error(monkeypatch, isolated_home):
+    """And the checks after it still run: doctor never fails fast."""
+    write_slurm_config()
+    install_ssh(monkeypatch, healthy_ssh_table())
+    relay_dir = isolated_home / ".relay"
+    relay_dir.write_text("something else lives here", encoding="utf-8")
+
+    checks = by_name(doctor.run_checks())
+
+    assert checks["control_dir"].status == doctor.ERROR
+    assert "not a directory" in checks["control_dir"].detail
+    assert str(relay_dir) in checks["control_dir"].detail
+    # doctor never deletes anything it found in the way.
+    assert relay_dir.read_text(encoding="utf-8") == "something else lives here"
+    # Never fail fast: the remote checks behind it still ran.
+    assert checks["master"].status == doctor.OK
+    assert checks["ssh"].status == doctor.OK
+    assert checks["database"].status == doctor.WARN
+
+
+def test_control_dir_skips_on_the_local_backend(isolated_home):
+    """No cluster, no ssh, no reason to create a control socket directory."""
+    write_config("backend: local\n")
+
+    result = by_name(doctor.run_checks())["control_dir"]
+
+    assert result.status == doctor.SKIP
+    assert "backend is local" in result.detail
+    assert not (isolated_home / ".relay").exists()
+
+
+def test_control_dir_runs_before_the_master_check(monkeypatch):
+    """Order is the whole point.
+
+    Every argv builder in `ssh.py` calls `ensure_control_dir()`, so the first
+    check that touches ssh repairs the directory as a side effect. Run after
+    that and this check would always find a tidy 0700 directory and report a
+    problem the user never got told about.
+    """
+    write_slurm_config()
+    install_ssh(monkeypatch, healthy_ssh_table())
+
+    names = [r.name for r in doctor.run_checks()]
+
+    assert names.index("control_dir") < names.index("master")
+    assert names.index("control_dir") == names.index("config") + 1
 
 
 # --------------------------------------------------------------------------
@@ -1296,6 +1459,10 @@ def test_a_fully_healthy_slurm_run_exits_zero(monkeypatch):
     master, `requeue_on_term: auto` resolving correctly against
     PreemptMode=REQUEUE, `preempt_grace: 10` fitting the 10 second window
     KillWait gives, and a time limit inside MaxTime.
+
+    `control_dir` is ok here too, by the "created it" path rather than the
+    "found it" one: the test HOME is fresh, so there is no `~/.relay` yet, and
+    creating one is a normal healthy outcome rather than a complaint.
     """
     write_slurm_config()
     install_ssh(monkeypatch, healthy_ssh_table())

@@ -1465,6 +1465,54 @@ def test_transport_error_exposes_the_returncode_and_stderr():
     )
 
 
+def test_transport_error_quotes_sshs_last_line_rather_than_advising():
+    """ssh's own explanation beats anything relay can guess.
+
+    The first real run on Klone failed with `unix_listener: cannot bind to
+    path ...` *after* Duo had already succeeded, and relay answered "check that
+    `ssh klone` works" -- advice aimed at the part that was working. ssh puts
+    banners first and the real reason last, so the last line is the one to
+    quote.
+
+    Limitation, stated plainly: `FakeRunner` never runs ssh, so this test could
+    not have caught the missing-ControlPath-directory bug itself -- that bind
+    happens inside the real ssh binary. This pins the *message shape* only.
+    Another test covers the real `ssh` path.
+    """
+    stderr = (
+        b"first line\n"
+        b"unix_listener: cannot bind to path /x/.relay/cm-abc.123: "
+        b"No such file or directory\n"
+    )
+    backend, _runner = make_backend((255, b"", stderr))
+    with pytest.raises(TransportError) as excinfo:
+        backend.status(["101"])
+
+    message = str(excinfo.value)
+    assert (
+        "unix_listener: cannot bind to path /x/.relay/cm-abc.123: "
+        "No such file or directory" in message
+    )
+    assert "Check that" not in message
+    # The full text is still on the exception: the daemon classifies from it.
+    assert "first line" in excinfo.value.stderr
+    assert "unix_listener" in excinfo.value.stderr
+
+
+def test_transport_error_falls_back_to_advice_when_ssh_said_nothing():
+    """Nothing to quote, so the old suggestion is the best relay has.
+
+    Same limitation as above: no real ssh runs here, only the message shape.
+    """
+    backend, _runner = make_backend((255, b"", b""))
+    with pytest.raises(TransportError) as excinfo:
+        backend.status(["101"])
+
+    message = str(excinfo.value)
+    assert "Check that `ssh klone` works" in message
+    assert excinfo.value.returncode == 255
+
+
 def test_transport_error_from_a_remote_read_failure_carries_its_status():
     backend, _runner = make_backend((1, b"", b"tail: cannot open: Permission denied\n"))
     with pytest.raises(TransportError) as excinfo:

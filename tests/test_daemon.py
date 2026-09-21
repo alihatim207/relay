@@ -20,6 +20,7 @@ is a test that fails on a loaded CI machine.
 
 from __future__ import annotations
 
+import stat
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,7 +32,7 @@ from relay import daemon as daemon_module
 from relay import ssh as ssh_module
 from relay.backends.base import Backend, JobSpec, UsageRow
 from relay.backends.local import LocalBackend
-from relay.backends.slurm import TransportError
+from relay.backends.slurm import SlurmBackend, TransportError
 from relay.daemon import (
     AUTH_CHECK_INTERVAL,
     INTERVAL_ACTIVE,
@@ -1173,3 +1174,68 @@ def test_run_forever_returns_immediately_if_already_stopped(store, backend):
 
     assert daemon.run_forever(stop) == 0
     assert daemon.cycles == 0
+
+
+# --------------------------------------------------------------------------
+# The ControlPath directory, from the daemon's side
+# --------------------------------------------------------------------------
+
+
+def test_a_daemon_cycle_creates_the_ssh_control_directory(
+    store, tmp_path, monkeypatch
+):
+    """The daemon's first ssh invocation must create `~/.relay` by itself.
+
+    The first real run on Klone failed with `unix_listener: cannot bind to
+    path ~/.relay/cm-...: No such file or directory`, because nothing had ever
+    created the ControlPath's parent directory. The fix lives in
+    `ssh.ensure_control_dir()`, called from every argv builder rather than from
+    `relay connect` alone -- and this test is why it cannot live only in
+    `connect`. The daemon and `doctor` can both run on a machine where
+    `relay connect` has never run: a daemon started at login, a `doctor` run as
+    a CI smoke test. Either would hit the same bind failure.
+
+    So: a real `SlurmBackend` (fake `runner`, nothing is spawned), HOME
+    redirected at an empty temporary directory, one `run_once()`, and the
+    directory has to be there afterwards.
+
+    Note what this test does *not* prove. The runner is a fake, so no socket is
+    ever bound; a fake can only ever show that the argv was built and the
+    directory appeared. The real bind is exercised in
+    `tests/test_ssh_integration.py`, which needs a local sshd and skips
+    without one.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    control_dir = tmp_path / ".relay"
+    assert not control_dir.exists()
+
+    calls: list[list[str]] = []
+
+    def runner(argv, input_bytes, timeout):
+        # Success with no output: squeue lists no live jobs, sacct knows
+        # nothing, the event log read comes back empty. A quiet cycle that
+        # still has to talk to the cluster, which is all this test needs.
+        calls.append(list(argv))
+        return 0, b"", b""
+
+    backend = SlurmBackend(
+        ssh_alias="klone",
+        remote_root="/r",
+        runner=runner,
+    )
+    store.create_run(
+        "vr_s1_ctl",
+        backend="slurm",
+        job_id="4242",
+        status="queued",
+        run_dir="/r/vr_s1_ctl",
+    )
+
+    Daemon(store, backend).run_once()
+
+    assert calls, "the cycle never reached ssh, so it proves nothing"
+    assert control_dir.is_dir(), (
+        "a daemon cycle ran ssh without creating the ControlPath directory; "
+        "a real ssh would have failed to bind its control socket"
+    )
+    assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700

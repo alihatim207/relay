@@ -58,14 +58,54 @@ UNREACHABLE = "unreachable"
 
 
 def relay_dir() -> Path:
-    """`~/.relay/`, created on demand. Holds only the control socket."""
-    path = Path(os.path.expanduser("~/.relay"))
-    path.mkdir(mode=0o700, exist_ok=True)
+    """`~/.relay/`, the directory the control socket lives in. Not created."""
+    return Path(os.path.expanduser("~/.relay"))
+
+
+def ensure_control_dir() -> Path:
+    """Make sure `~/.relay/` exists as a directory with mode 0700.
+
+    ssh does not create the ControlPath's parent directory. It fails with
+    "unix_listener: cannot bind to path ...: No such file or directory" --
+    *after* the user has answered Duo, which is the worst possible moment.
+    The first real run on Klone hit exactly that, and a fake ssh runner can
+    never catch it, because the bind happens inside the real ssh binary.
+
+    Called by every argv builder below, so any code path that is about to run
+    ssh -- `relay connect`, the daemon, doctor, the backend -- has the
+    directory in place first. The daemon and doctor can run before `connect`
+    ever has, so putting this only in `connect` would not be enough.
+
+    Mode 0700 is chmod'ed explicitly even when the directory already exists:
+    `mkdir(mode=)` only applies to a directory it creates, and a socket other
+    users can connect to is a socket other users can run commands through.
+    """
+    path = relay_dir()
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except FileExistsError:
+        # exist_ok only forgives an existing *directory*; a plain file at the
+        # path still raises. Fall through to the is_dir check so both shapes
+        # of "something is in the way" produce the same sentence.
+        pass
+    if not path.is_dir():
+        raise NotADirectoryError(
+            f"{path} exists but is not a directory. relay keeps its SSH control "
+            "socket there; move the file out of the way and try again."
+        )
+    if (path.stat().st_mode & 0o777) != 0o700:
+        os.chmod(path, 0o700)
     return path
 
 
 def _common_options() -> list[str]:
-    """Options shared by every relay ssh call, interactive or not."""
+    """Options shared by every relay ssh call, interactive or not.
+
+    Also the one place that guarantees the ControlPath directory exists: every
+    argv relay builds passes through here, so no ssh invocation can happen
+    without it.
+    """
+    ensure_control_dir()
     return [
         "-o", "ControlMaster=auto",
         "-o", f"ControlPath={CONTROL_PATH_TEMPLATE}",
@@ -115,6 +155,7 @@ def master_check_argv(alias: str) -> list[str]:
     never trigger Duo. Exit 0 means a live master; anything else means none.
     """
     _check_alias(alias)
+    ensure_control_dir()
     return ["ssh", "-o", f"ControlPath={CONTROL_PATH_TEMPLATE}", "-O", "check", alias]
 
 

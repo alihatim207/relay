@@ -183,6 +183,10 @@ Command-line `-o` options override `~/.ssh/config`, so this works whether or not
 
 `ControlPath` lives in `~/.relay/`, not the deeper XDG data directory, because Unix socket paths are limited to about 104 bytes. `%C` is a hash, which keeps the path short and unique per host.
 
+ssh does not create the ControlPath's parent directory; it fails with `unix_listener: cannot bind to path ...: No such file or directory` after Duo has already been answered. So every argv builder in `ssh.py` calls `ensure_control_dir()` first: `makedirs` with mode 0700, then `chmod` to 0700 if it already existed looser. That covers `connect`, the daemon, doctor, and the backend by construction; the daemon and doctor can run before `connect` ever has. `doctor` reports the directory's state as its own check. A fake ssh runner cannot catch this class of bug because the bind happens inside the real ssh binary, which is why `tests/test_ssh_integration.py` runs a real `ssh -M -N -f` against localhost when a local sshd is available and skips otherwise.
+
+When ssh exits 255, relay's error carries the last line of ssh's stderr. The generic "check that `ssh <alias>` works" advice appears only when stderr is empty.
+
 `BatchMode=yes` is essential: without it, a missing master makes ssh wait forever for a Duo prompt nobody will see, hanging the daemon.
 
 `relay connect` runs `ssh -M -N -f` with the same ControlPath and ControlPersist but **without** BatchMode, so the user can complete Duo interactively. On success it prints that the connection is established and how long it persists. Exits 4 on failure.
