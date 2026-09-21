@@ -1,7 +1,7 @@
 # relay
 
-A local-first experiment orchestrator for Slurm clusters. Submit training jobs
-from your laptop, watch live metrics, and have jobs survive preemption — with
+An experiment orchestrator for Slurm clusters. Submit training jobs
+from your laptop, watch live metrics, and have jobs survive preemption. Uses with
 no tracking server, no cloud account, and no inbound network connection to the
 cluster.
 
