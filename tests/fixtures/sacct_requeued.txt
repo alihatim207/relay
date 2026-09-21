@@ -1,0 +1,24 @@
+# SYNTHETIC -- hand-written to the documented `sacct --parsable2` format, NOT
+# captured from a real cluster. Replace this file with genuine Klone output:
+#
+#   SLURM_TIME_FORMAT=%s sacct -j <ids> -X --duplicates --noheader \
+#     --parsable2 --format=JobIDRaw,State,Partition,Start,End,ElapsedRaw,AllocTRES
+#
+# Keep this header when you do; the parser skips lines starting with '#'.
+#
+# Columns: JobIDRaw|State|Partition|Start|End|ElapsedRaw|AllocTRES
+#
+# One job ID, three attempts -- this is what `--duplicates` buys you. Without
+# that flag sacct returns only the last row and the first two preemptions'
+# GPU-hours vanish. The third attempt is still running, so End is empty.
+# Elapsed: 1800 + 2700 + 900 = 5400 seconds across the three attempts.
+12345700|PREEMPTED|ckpt-all|1758045000|1758046800|1800|billing=80,cpu=8,gres/gpu=2,mem=64G,node=1
+12345700|PREEMPTED|ckpt-all|1758047000|1758049700|2700|billing=80,cpu=8,gres/gpu=2,mem=64G,node=1
+12345700|RUNNING|ckpt-all|1758050000||900|billing=80,cpu=8,gres/gpu=2,mem=64G,node=1
+# A step row. `-X` should already have suppressed these, but sacct's flags
+# differ between Slurm versions and a step counted as an attempt would double
+# the bill, so the parser drops anything with a '.' in JobIDRaw.
+12345700.batch|COMPLETED|ckpt-all|1758045000|1758046800|1800|cpu=8,mem=64G,node=1
+# An attempt that was cancelled while still pending: it never started, so it
+# has no Start and consumed nothing. The parser skips it.
+12345701|CANCELLED by 123456||||0|

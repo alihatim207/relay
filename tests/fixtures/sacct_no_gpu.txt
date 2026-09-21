@@ -1,0 +1,17 @@
+# SYNTHETIC -- hand-written to the documented `sacct --parsable2` format, NOT
+# captured from a real cluster. Replace this file with genuine Klone output:
+#
+#   SLURM_TIME_FORMAT=%s sacct -j <ids> -X --duplicates --noheader \
+#     --parsable2 --format=JobIDRaw,State,Partition,Start,End,ElapsedRaw,AllocTRES
+#
+# Keep this header when you do; the parser skips lines starting with '#'.
+#
+# Columns: JobIDRaw|State|Partition|Start|End|ElapsedRaw|AllocTRES
+#
+# CPU-only work. No gres/gpu key anywhere: that is zero GPUs, not an error.
+# The last row uses sacct's *default* time format, which is what you get if
+# SLURM_TIME_FORMAT is not set -- no timezone, cluster-local. The parser
+# passes it through unchanged rather than guessing a zone for it.
+12345900|COMPLETED|compute|1758045729|1758047529|1800|billing=4,cpu=4,mem=16G,node=1
+12345901|CANCELLED by 654321|compute|1758046000|1758046060|60|billing=2,cpu=2,mem=8G,node=1
+12345902|COMPLETED|compute|2026-09-16T11:22:09|2026-09-16T12:22:09|3600|billing=1,cpu=1,mem=4G,node=1

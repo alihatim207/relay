@@ -1,0 +1,14 @@
+# SYNTHETIC -- hand-written to the documented `sacct --parsable2` format, NOT
+# captured from a real cluster. Replace this file with genuine Klone output:
+#
+#   SLURM_TIME_FORMAT=%s sacct -j <ids> -X --duplicates --noheader \
+#     --parsable2 --format=JobIDRaw,State,Partition,Start,End,ElapsedRaw,AllocTRES
+#
+# Keep this header when you do; the parser skips lines starting with '#', and
+# a fixture that does not say where it came from is a fixture nobody trusts.
+#
+# Columns: JobIDRaw|State|Partition|Start|End|ElapsedRaw|AllocTRES
+# One completed GPU job, one completed CPU-only job, one still running.
+12345601|COMPLETED|ckpt-all|1758045729|1758060129|14400|billing=80,cpu=8,gres/gpu=2,mem=64G,node=1
+12345602|FAILED|ckpt-all|1758046000|1758046180|180|billing=4,cpu=4,mem=16G,node=1
+12345603|RUNNING|ckpt-g2|1758070000|Unknown|3600|billing=160,cpu=16,gres/gpu=4,mem=128G,node=1

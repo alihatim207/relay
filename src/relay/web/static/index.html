@@ -1,0 +1,785 @@
+<!doctype html>
+<!--
+  relay dashboard: the entire front end, in one file.
+
+  No build step, no npm, no framework. One <style> block, one <script> block,
+  and Chart.js from a CDN. That is a deliberate choice: this page is a tool for
+  one person watching their own jobs, and a toolchain would cost more to
+  maintain than the page itself.
+
+  Everything it knows comes from the JSON endpoints in app.py, which read
+  SQLite. The page never talks to the cluster.
+
+  The one idea worth understanding here is incremental polling. Every two
+  seconds we ask for metrics *after the last step we already have* and logs
+  *after the last seq we already have*, then append what comes back to the
+  charts and the log pane. A run with 200k points transfers those points once,
+  not every two seconds forever.
+
+  The second idea is that not everything moves at the same speed. Metrics and
+  run status are live and poll every two seconds. Usage accounting is not
+  live: the daemon fetches it from sacct every five minutes, so the page polls
+  it on its own 30-second timer. Polling it at 2s would ask four hundred and
+  fifty times per change.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relay</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f26;
+    --line: #2b3039;
+    --text: #e6e8ec;
+    --dim: #8d95a3;
+    --accent: #6ea8fe;
+    --warn: #e0b34a;
+    --bad: #e06c6c;
+    --good: #6fcf86;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: 0.08em; }
+  main { padding: 20px; }
+  .dim { color: var(--dim); }
+  button {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    text-align: left;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  th { color: var(--dim); font-weight: normal; }
+  tr.run { cursor: pointer; }
+  tr.run:hover td { background: var(--panel); }
+  td.metrics { white-space: normal; color: var(--dim); }
+
+  .status { text-transform: uppercase; font-size: 12px; letter-spacing: 0.06em; }
+  .status-running { color: var(--good); }
+  .status-queued { color: var(--accent); }
+  .status-completed { color: var(--dim); }
+  .status-failed, .status-cancelled { color: var(--bad); }
+  .status-requeued { color: var(--warn); }
+  .stale { color: var(--warn); }
+
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 14px;
+    margin: 16px 0;
+  }
+  .chart-box {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px;
+    height: 240px;
+  }
+  .detail-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  #logs {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px;
+    height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 13px;
+  }
+  .log-stderr { color: var(--bad); }
+  .log-relay { color: var(--accent); font-style: italic; }
+  .hidden { display: none; }
+  .bad { color: var(--bad); }
+  .warn { color: var(--warn); }
+  #error {
+    margin: 10px 20px;
+    padding: 8px 12px;
+    border: 1px solid var(--bad);
+    border-radius: 4px;
+    color: var(--bad);
+  }
+
+  /* The daemon-state banner. `auth_required` is loud, because the user has to
+     do something (run `relay connect`) before anything updates again.
+     `unreachable` is muted: it usually clears by itself. */
+  #banner {
+    margin: 10px 20px;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+  }
+  #banner.auth {
+    border-color: var(--warn);
+    color: var(--warn);
+    font-weight: bold;
+  }
+  #banner.unreachable { color: var(--dim); }
+
+  /* Usage panel */
+  .panel {
+    margin-top: 26px;
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+  }
+  .usage-head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  select, input[type="date"] {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 3px 6px;
+  }
+  .caption { margin: 14px 0 4px; letter-spacing: 0.06em; }
+  .totals {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .tile {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px 14px;
+    min-width: 120px;
+  }
+  .tile .value { font-size: 18px; }
+  .tile .label { color: var(--dim); font-size: 12px; letter-spacing: 0.06em; }
+  .usage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 20px;
+  }
+  .wasted-line { margin: 4px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>relay</h1>
+  <span id="sync" class="dim">&nbsp;</span>
+</header>
+
+<!-- Daemon health. Filled from the /api/runs poll, so it is never more than
+     two seconds out of date, and hidden entirely when nothing is wrong. -->
+<div id="banner" class="hidden"></div>
+
+<div id="error" class="hidden"></div>
+
+<main>
+  <!-- List view -->
+  <section id="list-view">
+    <table>
+      <thead>
+        <tr>
+          <th>run</th><th>name</th><th>status</th><th>step</th><th>latest metrics</th>
+        </tr>
+      </thead>
+      <tbody id="runs-body"></tbody>
+    </table>
+    <p id="no-runs" class="dim hidden">No runs yet. Submit one with <code>relay submit</code>.</p>
+
+    <!-- Usage. Everything here is derived from the `usage` table by SQL in
+         store.py; the page only formats numbers. -->
+    <section id="usage-section" class="panel">
+      <div class="usage-head">
+        <strong>usage</strong>
+        <label class="dim">by
+          <select id="usage-by">
+            <option value="run">run</option>
+            <option value="group">group</option>
+            <option value="partition">partition</option>
+          </select>
+        </label>
+        <label class="dim">since
+          <input id="usage-since" type="date">
+        </label>
+        <span id="usage-error" class="bad hidden"></span>
+      </div>
+
+      <div id="usage-totals" class="totals"></div>
+
+      <div class="usage-grid">
+        <div>
+          <div class="dim caption">by <span id="usage-by-label">run</span></div>
+          <table>
+            <thead>
+              <tr><th id="usage-key-head">run</th><th>gpu-h</th><th>cpu-h</th>
+                  <th>attempts</th><th>runs</th></tr>
+            </thead>
+            <tbody id="usage-rows"></tbody>
+          </table>
+          <p id="no-usage" class="dim hidden">
+            No usage recorded yet. The daemon fetches it every five minutes.
+          </p>
+        </div>
+        <div>
+          <div class="dim caption">partition split</div>
+          <table>
+            <thead><tr><th>partition</th><th>gpu-h</th><th>cpu-h</th></tr></thead>
+            <tbody id="usage-partitions"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="dim caption">wasted hours</div>
+      <div id="wasted"></div>
+    </section>
+  </section>
+
+  <!-- Detail view -->
+  <section id="detail-view" class="hidden">
+    <div class="detail-head">
+      <button id="back">&larr; all runs</button>
+      <strong id="detail-id"></strong>
+      <span id="detail-status" class="status"></span>
+      <span id="detail-meta" class="dim"></span>
+      <button id="cancel" class="danger">cancel run</button>
+    </div>
+
+    <!-- One row per scheduler attempt. A run preempted three times has four
+         rows here, and each one burned real hours. -->
+    <div class="dim caption">attempts</div>
+    <table>
+      <thead>
+        <tr><th>#</th><th>job</th><th>state</th><th>partition</th>
+            <th>start</th><th>end</th><th>elapsed</th><th>gpus</th><th>cpus</th></tr>
+      </thead>
+      <tbody id="attempts-body"></tbody>
+    </table>
+    <p id="no-attempts" class="dim hidden">
+      No scheduler usage recorded for this run yet.
+    </p>
+
+    <div id="charts" class="charts"></div>
+    <div class="dim" style="margin-bottom:6px">logs</div>
+    <div id="logs"></div>
+  </section>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+// Plain module-level variables rather than a store or a framework. There are
+// five of them and one timer; anything more structured would be ceremony.
+
+const POLL_MS = 2000;      // status, metrics and logs: live data
+// Usage is NOT live data. The daemon fetches it from sacct every five minutes
+// (one batched call), so polling it every two seconds would send 150 requests
+// per actual change. Thirty seconds is already generous.
+const USAGE_POLL_MS = 30000;
+const LOG_LINES_MAX = 2000; // trim the log pane so a chatty run cannot eat RAM
+
+let currentRun = null;   // run_id being shown in detail view, or null for list
+let charts = {};         // metric name -> Chart instance
+let lastStep = {};       // metric name -> highest step we have already drawn
+let lastSeq = 0;         // highest log event seq we have already printed
+let autoScroll = true;   // stick the log pane to the bottom unless scrolled up
+
+// ---------------------------------------------------------------------------
+// Tiny helpers
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+
+async function getJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    // FastAPI puts our plain-sentence message in `detail`.
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+function showError(message) {
+  const box = $('error');
+  if (!message) { box.classList.add('hidden'); return; }
+  box.textContent = message;
+  box.classList.remove('hidden');
+}
+
+function formatMetrics(values) {
+  // Objects keep insertion order for string keys, and the API hands them back
+  // in whatever order SQLite produced; sort so the columns do not shuffle
+  // between polls.
+  return Object.keys(values).sort()
+    .map((k) => k + '=' + formatNumber(values[k]))
+    .join('  ');
+}
+
+function formatNumber(x) {
+  if (typeof x !== 'number') return String(x);
+  if (x !== 0 && (Math.abs(x) < 1e-3 || Math.abs(x) >= 1e6)) return x.toExponential(3);
+  return Math.round(x) === x ? String(x) : x.toFixed(4);
+}
+
+function esc(value) {
+  // Everything we render came out of the database, and a run name is whatever
+  // the user typed on the command line. Building HTML strings with innerHTML
+  // means a name containing "<" would otherwise become markup.
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatHours(hours) {
+  // Two decimals everywhere: usage is a budgeting number, not a measurement,
+  // and 0.00 is a more honest answer than 3.6e-3.
+  return (typeof hours === 'number' ? hours : 0).toFixed(2);
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return h + 'h' + String(m).padStart(2, '0') + 'm';
+  if (m) return m + 'm' + String(s).padStart(2, '0') + 's';
+  return s + 's';
+}
+
+// `cost` is absent from the API response unless cost.gpu_hour_rate is set in
+// the config. No rate means no dollar figure anywhere -- relay never invents
+// a price, and this is the single place the page enforces that.
+function formatMoney(amount, cost) {
+  if (!cost || amount === null || amount === undefined) return '';
+  return ' · $' + amount.toFixed(2);
+}
+
+function renderBanner(state) {
+  // Two kinds of transport failure, two very different messages. Only
+  // `auth_required` needs the user to do something, so only it is loud; for
+  // `unreachable` the daemon is already retrying with backoff and the laptop
+  // has probably just changed networks.
+  const box = $('banner');
+  const kind = state ? state.last_error_kind : null;
+
+  if (kind === 'auth_required') {
+    box.className = 'auth';
+    box.textContent = 'Authentication needed. Run `relay connect`.';
+  } else if (kind === 'unreachable') {
+    box.className = 'unreachable';
+    box.textContent = 'Cluster unreachable since ' + (state.last_error_ts || 'an unknown time');
+  } else {
+    box.className = 'hidden';
+    box.textContent = '';
+  }
+}
+
+function renderSync(ageSeconds) {
+  // Always say how old the data is. Stale data the user knows is stale is
+  // fine; stale data presented as current is not.
+  $('sync').textContent = (ageSeconds === null || ageSeconds === undefined)
+    ? 'daemon has not synced yet'
+    : 'last synced ' + Math.max(0, Math.round(ageSeconds)) + 's ago';
+}
+
+// ---------------------------------------------------------------------------
+// List view
+// ---------------------------------------------------------------------------
+
+async function refreshList() {
+  const data = await getJSON('/api/runs');
+  renderSync(data.last_synced_age_seconds);
+  // Daemon health rides in the runs envelope rather than having an endpoint
+  // of its own: this poll already runs every two seconds.
+  renderBanner(data.daemon_state);
+
+  const body = $('runs-body');
+  body.innerHTML = '';
+  $('no-runs').classList.toggle('hidden', data.runs.length > 0);
+
+  for (const run of data.runs) {
+    const tr = document.createElement('tr');
+    tr.className = 'run';
+    tr.onclick = () => openRun(run.run_id);
+
+    const status = run.status + (run.stale ? ' (stale)' : '');
+    tr.innerHTML =
+      '<td>' + esc(run.run_id) + '</td>' +
+      '<td class="dim">' + esc(run.name || '') + '</td>' +
+      '<td class="status status-' + esc(run.status) + (run.stale ? ' stale' : '') + '">' +
+        esc(status) + '</td>' +
+      '<td>' + (run.last_step === null ? '' : esc(run.last_step)) + '</td>' +
+      '<td class="metrics">' + esc(formatMetrics(run.latest_metrics)) + '</td>';
+    body.appendChild(tr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+
+async function refreshUsage() {
+  const by = $('usage-by').value;
+  const since = $('usage-since').value;   // '' when the date input is empty
+
+  let url = '/api/usage?by=' + encodeURIComponent(by);
+  if (since) url += '&since=' + encodeURIComponent(since);
+
+  let data;
+  try {
+    data = await getJSON(url);
+  } catch (exc) {
+    // Shown inside the panel, not in the page-wide error box: a date the
+    // server cannot read should not make the run list look broken.
+    $('usage-error').textContent = exc.message;
+    $('usage-error').classList.remove('hidden');
+    return;
+  }
+  $('usage-error').classList.add('hidden');
+
+  const cost = data.cost;  // undefined unless a gpu_hour_rate is configured
+  $('usage-by-label').textContent = data.by;
+  $('usage-key-head').textContent = data.by;
+
+  renderTotals(data.totals, cost);
+  renderUsageRows(data.rows);
+  renderPartitions(data.totals.by_partition);
+  renderWasted(data.wasted, cost);
+}
+
+function renderTotals(totals, cost) {
+  const tiles = [
+    ['gpu-hours', formatHours(totals.gpu_hours) + formatMoney(cost && cost.total, cost)],
+    ['cpu-hours', formatHours(totals.cpu_hours)],
+    ['attempts', totals.attempts],
+    ['runs', totals.runs]
+  ];
+  $('usage-totals').innerHTML = tiles.map(function (tile) {
+    return '<div class="tile"><div class="value">' + esc(tile[1]) + '</div>' +
+           '<div class="label">' + esc(tile[0]) + '</div></div>';
+  }).join('');
+}
+
+function renderUsageRows(rows) {
+  $('no-usage').classList.toggle('hidden', rows.length > 0);
+  $('usage-rows').innerHTML = rows.map(function (row) {
+    return '<tr><td>' + esc(row.key) + '</td>' +
+           '<td>' + formatHours(row.gpu_hours) + '</td>' +
+           '<td>' + formatHours(row.cpu_hours) + '</td>' +
+           '<td>' + esc(row.attempts) + '</td>' +
+           '<td>' + esc(row.runs) + '</td></tr>';
+  }).join('');
+}
+
+function renderPartitions(partitions) {
+  // The point of the split on Klone: how much ran for free on preemptible
+  // ckpt* nodes versus how much charged the group's own allocation.
+  $('usage-partitions').innerHTML = partitions.map(function (row) {
+    return '<tr><td>' + esc(row.partition) + '</td>' +
+           '<td>' + formatHours(row.gpu_hours) + '</td>' +
+           '<td>' + formatHours(row.cpu_hours) + '</td></tr>';
+  }).join('');
+}
+
+function renderWasted(wasted, cost) {
+  const failed = wasted.failed;
+  const lost = wasted.lost_to_preemption;
+
+  let html =
+    '<div class="wasted-line">failed: <strong>' + formatHours(failed.gpu_hours) +
+    '</strong> gpu-h · ' + formatHours(failed.cpu_hours) + ' cpu-h' +
+    esc(formatMoney(cost && cost.wasted_failed, cost)) +
+    (failed.runs.length
+      ? ' <span class="dim">(' + failed.runs.map(esc).join(', ') + ')</span>'
+      : '') +
+    '</div>' +
+    '<div class="wasted-line">lost to preemption: <strong>' + formatHours(lost.gpu_hours) +
+    '</strong> gpu-h · ' + formatHours(lost.cpu_hours) + ' cpu-h' +
+    esc(formatMoney(cost && cost.wasted_lost, cost)) + '</div>';
+
+  if (lost.attempts.length) {
+    html += '<table><thead><tr><th>run</th><th>job</th><th>ended</th>' +
+            '<th>lost</th><th>gpus</th><th></th></tr></thead><tbody>' +
+            lost.attempts.map(function (attempt) {
+              // no_checkpoints means the whole attempt counts as lost, because
+              // nothing was saved to resume from. Usually that is a script not
+              // printing checkpoints rather than one that never saves, which
+              // is exactly why it is worth saying out loud.
+              const flag = attempt.no_checkpoints
+                ? '<span class="warn">no checkpoints reported</span>' : '';
+              return '<tr><td>' + esc(attempt.run_id) + '</td>' +
+                     '<td>' + esc(attempt.job_id) + '</td>' +
+                     '<td class="dim">' + esc(attempt.end || '') + '</td>' +
+                     '<td>' + esc(formatDuration(attempt.lost_s)) + '</td>' +
+                     '<td>' + esc(attempt.gpus) + '</td>' +
+                     '<td>' + flag + '</td></tr>';
+            }).join('') + '</tbody></table>';
+  }
+  $('wasted').innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Detail view
+// ---------------------------------------------------------------------------
+
+function openRun(runId) {
+  currentRun = runId;
+  // Reset every incremental cursor: we are starting this run's charts and log
+  // pane from empty, so the next fetch must ask for everything.
+  charts = {};
+  lastStep = {};
+  lastSeq = 0;
+  autoScroll = true;
+  $('charts').innerHTML = '';
+  $('logs').textContent = '';
+  $('detail-id').textContent = runId;
+  $('list-view').classList.add('hidden');
+  $('detail-view').classList.remove('hidden');
+  location.hash = '#run/' + runId;
+  tick();
+}
+
+function closeRun() {
+  currentRun = null;
+  charts = {};
+  location.hash = '';
+  $('detail-view').classList.add('hidden');
+  $('list-view').classList.remove('hidden');
+  tick();
+  refreshUsage();  // the panel is on screen again; do not wait up to 30s for it
+}
+
+function ensureChart(name) {
+  if (charts[name]) return charts[name];
+
+  const box = document.createElement('div');
+  box.className = 'chart-box';
+  const canvas = document.createElement('canvas');
+  box.appendChild(canvas);
+  $('charts').appendChild(box);
+
+  charts[name] = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { datasets: [{
+      label: name,
+      data: [],
+      borderColor: '#6ea8fe',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0
+    }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,          // redrawing every 2s; animation would never finish
+      normalized: true,          // we always append in ascending step order
+      parsing: false,            // data is already {x, y}, so skip Chart.js's parser
+      interaction: { mode: 'nearest', intersect: false },
+      scales: {
+        x: { type: 'linear', title: { display: true, text: 'step' },
+             grid: { color: '#2b3039' }, ticks: { color: '#8d95a3' } },
+        y: { grid: { color: '#2b3039' }, ticks: { color: '#8d95a3' } }
+      },
+      plugins: { legend: { labels: { color: '#e6e8ec' } } }
+    }
+  });
+  return charts[name];
+}
+
+async function refreshDetail() {
+  const runId = currentRun;
+  const run = await getJSON('/api/runs/' + encodeURIComponent(runId));
+  if (currentRun !== runId) return;  // user navigated away mid-request
+
+  renderSync(run.last_synced_age_seconds);
+  $('detail-status').textContent = run.status + (run.stale ? ' (stale)' : '');
+  $('detail-status').className = 'status status-' + run.status + (run.stale ? ' stale' : '');
+  $('detail-meta').textContent =
+    (run.backend || '') + ' · job ' + (run.job_id || '-') + ' · step ' +
+    (run.last_step === null ? '-' : run.last_step) +
+    // `attempts` is counted from run_started events, so it can be one ahead of
+    // the usage table: the sidecar knows a new attempt started immediately,
+    // sacct only tells us at the next usage fetch.
+    ' · ' + (run.attempts || 0) + ' attempt' + ((run.attempts || 0) === 1 ? '' : 's');
+  $('cancel').classList.toggle('hidden', !!run.terminal);
+  renderAttempts(run.usage || []);
+
+  for (const name of run.metric_names) {
+    await refreshMetric(runId, name);
+    if (currentRun !== runId) return;
+  }
+  await refreshLogs(runId);
+}
+
+function renderAttempts(usage) {
+  $('no-attempts').classList.toggle('hidden', usage.length > 0);
+  $('attempts-body').innerHTML = usage.map(function (row, index) {
+    return '<tr><td>' + (index + 1) + '</td>' +
+           '<td>' + esc(row.job_id) + '</td>' +
+           '<td>' + esc(row.state) + '</td>' +
+           '<td>' + esc(row.partition || '') + '</td>' +
+           '<td class="dim">' + esc(row.start) + '</td>' +
+           // No `end` means the attempt is still running, which is a fact
+           // worth showing rather than an empty cell.
+           '<td class="dim">' + esc(row.end || '(running)') + '</td>' +
+           '<td>' + esc(formatDuration(row.elapsed_s)) + '</td>' +
+           '<td>' + esc(row.gpus) + '</td>' +
+           '<td>' + esc(row.cpus) + '</td></tr>';
+  }).join('');
+}
+
+async function refreshMetric(runId, name) {
+  // Here is the incremental fetch. `lastStep[name]` is the highest step
+  // already on the chart; `since` is exclusive server-side, so we get only
+  // what is new. On the very first poll it is undefined and we omit the
+  // parameter entirely -- we must not send since=0, because step 0 is a real
+  // step and would be dropped.
+  const since = lastStep[name];
+  let url = '/api/runs/' + encodeURIComponent(runId) + '/metrics/' + encodeURIComponent(name);
+  if (since !== undefined && since !== null) url += '?since=' + since;
+
+  const data = await getJSON(url);
+  if (currentRun !== runId) return;
+  if (data.points.length === 0) return;
+
+  const chart = ensureChart(name);
+  for (const point of data.points) {
+    chart.data.datasets[0].data.push({ x: point.step, y: point.value });
+  }
+  lastStep[name] = data.points[data.points.length - 1].step;
+  chart.update('none');  // 'none' = redraw without animating
+}
+
+async function refreshLogs(runId) {
+  // Same trick, keyed on event seq instead of step.
+  const url = '/api/runs/' + encodeURIComponent(runId) + '/logs?since_seq=' + lastSeq;
+  const data = await getJSON(url);
+  if (currentRun !== runId || data.logs.length === 0) return;
+
+  const pane = $('logs');
+  for (const event of data.logs) {
+    const payload = event.payload || {};
+    const div = document.createElement('div');
+    if (payload.stream === 'stderr') div.className = 'log-stderr';
+    // relay's own lines (e.g. "resuming from ...") come from the sidecar, not
+    // the training script; a distinct colour keeps the two apart.
+    if (payload.stream === 'relay') div.className = 'log-relay';
+    // The web layer does not own the log payload's shape, so fall back to
+    // dumping it rather than assuming a key exists.
+    div.textContent = payload.line !== undefined ? payload.line
+                    : payload.text !== undefined ? payload.text
+                    : JSON.stringify(payload);
+    pane.appendChild(div);
+  }
+  lastSeq = data.logs[data.logs.length - 1].seq;
+
+  while (pane.childElementCount > LOG_LINES_MAX) pane.removeChild(pane.firstChild);
+  if (autoScroll) pane.scrollTop = pane.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Cancel
+// ---------------------------------------------------------------------------
+
+async function cancelRun() {
+  const runId = currentRun;
+  if (!runId) return;
+  // A confirm() because the button is two clicks from a chart and the thing
+  // on the other end may be an eight-hour job.
+  if (!confirm('Cancel run ' + runId + '? The job will be stopped.')) return;
+
+  // POST, never GET: a prefetcher following a GET link would cancel runs by
+  // itself. The server only registers POST for this route.
+  const response = await fetch('/api/runs/' + encodeURIComponent(runId) + '/cancel',
+                               { method: 'POST' });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch (e) {}
+    showError(detail);
+    return;
+  }
+  showError(null);
+  $('detail-meta').textContent += ' · cancel requested';
+}
+
+// ---------------------------------------------------------------------------
+// The poll loop
+// ---------------------------------------------------------------------------
+
+async function tick() {
+  try {
+    if (currentRun) await refreshDetail();
+    else await refreshList();
+    showError(null);
+  } catch (exc) {
+    // A failed poll is not fatal: the daemon may be mid-write, or the page may
+    // have outlived the server. Say so and try again in two seconds.
+    showError(exc.message);
+  }
+}
+
+function usageTick() {
+  // Only while the list view is on screen: the usage panel lives there, and a
+  // request whose result nobody can see is a request not worth making.
+  if (!currentRun) refreshUsage();
+}
+
+$('back').onclick = closeRun;
+$('cancel').onclick = cancelRun;
+// Changing a filter refetches immediately rather than waiting up to 30s.
+$('usage-by').onchange = refreshUsage;
+$('usage-since').onchange = refreshUsage;
+$('logs').onscroll = function () {
+  // Only follow the tail while the user is already at the bottom, so reading
+  // back through the log does not get yanked away every two seconds.
+  const pane = $('logs');
+  autoScroll = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 20;
+};
+
+// Deep link support: #run/<id> survives a refresh.
+const hash = location.hash.match(/^#run\/(.+)$/);
+if (hash) openRun(decodeURIComponent(hash[1]));
+else tick();
+
+// Two timers, because the two kinds of data move at different speeds.
+setInterval(tick, POLL_MS);
+setInterval(usageTick, USAGE_POLL_MS);
+usageTick();
+</script>
+</body>
+</html>

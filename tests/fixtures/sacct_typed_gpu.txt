@@ -1,0 +1,20 @@
+# SYNTHETIC -- hand-written to the documented `sacct --parsable2` format, NOT
+# captured from a real cluster. Replace this file with genuine Klone output:
+#
+#   SLURM_TIME_FORMAT=%s sacct -j <ids> -X --duplicates --noheader \
+#     --parsable2 --format=JobIDRaw,State,Partition,Start,End,ElapsedRaw,AllocTRES
+#
+# Keep this header when you do; the parser skips lines starting with '#'.
+#
+# Columns: JobIDRaw|State|Partition|Start|End|ElapsedRaw|AllocTRES
+#
+# AllocTRES spells GPUs two ways and sometimes both at once. All three rows
+# below allocated exactly 2 GPUs; the parser must report 2 for each and must
+# never add the typed and untyped keys together.
+#
+# typed only
+12345800|COMPLETED|ckpt-all|1758045729|1758049329|3600|billing=80,cpu=8,gres/gpu:a40=2,mem=64G,node=1
+# both keys present, describing the same two GPUs -- untyped wins
+12345801|COMPLETED|ckpt-all|1758045729|1758049329|3600|billing=80,cpu=8,gres/gpu=2,gres/gpu:a40=2,mem=64G,node=1
+# two different types on one allocation: take the first typed key, do not sum
+12345802|COMPLETED|ckpt-g2|1758045729|1758049329|3600|billing=160,cpu=16,gres/gpu:l40s=2,gres/gpu:h200=1,mem=128G,node=1

@@ -1,0 +1,136 @@
+# relay
+
+A local-first experiment orchestrator for Slurm clusters. Submit training jobs
+from your laptop, watch live metrics, and have jobs survive preemption — with
+no tracking server, no cloud account, and no inbound network connection to the
+cluster.
+
+## How it works
+
+Compute nodes have no inbound network path. They can only write files to a
+shared filesystem, so that is the entire channel:
+
+1. A **sidecar** process wraps your training command inside the job and appends
+   events to `events.jsonl` on shared storage.
+2. A **daemon** on your laptop tails that file over SSH and writes into local
+   SQLite.
+3. The **CLI** and a **web dashboard** read that SQLite.
+
+No component calls another component's functions. The only shared contracts
+are the event log format and the database schema.
+
+## Install
+
+```sh
+pip install -e .
+```
+
+## Usage
+
+```sh
+relay init                 # write config
+relay connect              # open the SSH master (answer Duo once)
+relay doctor               # check everything end to end
+relay submit train.py --time 04:00:00 --seeds 0-4 -- --lr 3e-4
+relay ls                   # list runs
+relay show <run>           # run detail, attempts, usage
+relay logs <run>           # stream logs
+relay usage                # GPU-hours, CPU-hours, wasted hours
+relay dash                 # local web dashboard
+relay daemon               # start the sync daemon
+```
+
+Training scripts report metrics by printing a line like:
+
+```
+##relay## {"step": 1000, "loss": 0.412}
+```
+
+with `flush=True`. No import required.
+
+## Checkpointing under preemption
+
+On a preemptible partition your job can be evicted at any moment, including in
+its first minute. Slurm sends SIGTERM and then SIGKILL a fixed number of
+seconds later — 10 on UW Klone, and relay cannot extend that window. The
+sidecar forwards the SIGTERM to your script immediately and gives it
+`preempt_grace - 2` seconds before killing it, but that is a best-effort save,
+not a guarantee. Write your training script accordingly:
+
+- **Checkpoint periodically anyway.** The signal handler only makes your last
+  checkpoint more recent, and only when the save fits in the window. It is not
+  a substitute for saving on a schedule. If a checkpoint takes 30 seconds to
+  write and the window is 10, the signal-triggered save will not finish.
+
+- **Save atomically.** Write to a temporary file and `os.replace()` it into
+  place:
+
+  ```python
+  torch.save(state, path + ".tmp")
+  os.replace(path + ".tmp", path)
+  ```
+
+  `os.replace` is a rename, which is atomic. A save cut off by SIGKILL then
+  leaves the previous checkpoint intact instead of a half-written file that
+  will not load.
+
+- **Make the SIGTERM handler safe to run twice.** Your script can receive
+  SIGTERM from Slurm directly *and* from the sidecar forwarding it. Guard the
+  handler with a flag and return immediately on the second call.
+
+A run whose time limit is approaching is handled separately: Slurm sends
+SIGUSR1 first (relay asks for it with `--signal=B:USR1@<grace>`), and on that
+signal the sidecar checkpoints, ends the attempt as `requeued`, and puts the
+job back in the queue itself.
+
+## Resuming after preemption
+
+Relay works fully without either of these. Both are optional.
+
+**If your script already writes checkpoints**, two config lines tell relay how
+to find the newest one and hand it back on the next attempt:
+
+```yaml
+resume:
+  checkpoint_glob: "checkpoints/*.pt"   # relative to the job's working dir, ** allowed
+  arg: "--resume {path}"                 # appended to the command; {path} is shell-quoted
+```
+
+On the first attempt nothing happens. On every attempt after a preemption, the
+sidecar finds files matching the glob that were written since the run began,
+picks the newest, and appends `--resume <that file>` to your command. The glob
+is relative to the directory your script runs in: on Slurm that is the run
+directory (relay submits with `--chdir`), locally it is wherever you ran
+`relay submit`. Write checkpoints relative to the current directory and the
+same glob works in both places. `relay
+show` lists what each attempt resumed from. Per-run overrides:
+`relay submit --checkpoint-glob ... --resume-arg ...`.
+
+**If your script does not checkpoint**, use the helper relay ships next to
+your job. It is one file, standard library only, importable because the run
+directory is on `PYTHONPATH`:
+
+```python
+import relay_ckpt
+
+state = relay_ckpt.restore(lambda: {"params": init_params(), "opt": init_opt()})
+for step in range(relay_ckpt.step, total_steps):
+    state = train_step(state)
+    relay_ckpt.tick(state)
+```
+
+`tick` saves every ten minutes by default (`relay_ckpt.configure(every_minutes=...,
+every_steps=..., keep=2)` to change it). When Slurm sends SIGTERM, the next
+`tick` saves and exits cleanly, so a `finally` block still runs; after the
+requeue, `restore` returns the saved state and `relay_ckpt.step` picks up where
+the loop left off. Saves go through a temporary file and `os.replace`, JAX
+arrays are pulled to host and torch tensors to CPU automatically, and each save
+prints a `##relay##` checkpoint line so the dashboard sees it.
+
+**One limitation.** `relay cancel` writes a `CANCEL_REQUESTED` file into the
+run directory before it sends the cancel, which is how the sidecar knows not to
+requeue a run you asked it to stop. A run cancelled with raw `scancel` has no
+such file, so if it is configured with `requeue_on_term: always` it can requeue
+itself and come back. Cancel through relay, or use `requeue_on_term: auto`
+(the default), which resolves to `never` on any partition whose `PreemptMode`
+already includes `REQUEUE` — including Klone's.

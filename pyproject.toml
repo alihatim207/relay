@@ -1,0 +1,33 @@
+[project]
+name = "relay"
+version = "0.1.0"
+description = "Local-first experiment orchestrator for Slurm clusters"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+# fastapi's TestClient is a thin wrapper over httpx, so httpx is needed to test
+# the dashboard even though relay itself never makes an HTTP request.
+test = ["pytest", "httpx"]
+
+[project.scripts]
+relay = "relay.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"relay.web" = ["static/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
