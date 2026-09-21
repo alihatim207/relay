@@ -485,7 +485,15 @@ def test_cancel_stops_the_process_group_and_the_sidecar_records_it(tmp_path):
     backend.cancel(job_id)
 
     # The whole group goes away: wrapper shell, sidecar, training script.
+    #
+    # `status()` first, because it `poll()`s the wrapper and reaps it. The
+    # wrapper is *our* child, so once it exits it lingers as a zombie until
+    # somebody reaps it -- and a zombie still counts as a member of its process
+    # group on Linux, where `killpg(pgid, 0)` keeps succeeding until it is
+    # gone. (macOS does not count zombies there, which is why this only ever
+    # failed in CI.) The daemon reaps the same way, every cycle, via status().
     def group_is_gone():
+        backend.status([job_id])
         try:
             os.killpg(pid, 0)
         except (ProcessLookupError, PermissionError):
