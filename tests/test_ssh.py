@@ -220,12 +220,55 @@ def test_build_ssh_argv_has_the_six_options_in_order_then_the_alias():
     argv = ssh.build_ssh_argv(ALIAS, ["squeue", "--me"])
 
     assert argv[0] == "ssh"
-    assert argv[1:13] == EXPECTED_OPTIONS
+    # -T first: relay's commands are probes whose output it parses, never
+    # interactive sessions, so no pseudo-terminal.
+    assert argv[1] == "-T"
+    assert argv[2:14] == EXPECTED_OPTIONS
     # BatchMode is last of the options and the alias comes straight after it,
     # bare, with the remote command trailing.
-    assert argv[11:13] == ["-o", "BatchMode=yes"]
-    assert argv[13] == ALIAS
-    assert argv[14:] == ["squeue", "--me"]
+    assert argv[12:14] == ["-o", "BatchMode=yes"]
+    assert argv[14] == ALIAS
+    assert argv[15:] == ["squeue", "--me"]
+
+
+def test_connect_argv_has_no_dash_T():
+    # `-N` runs no command at all, so there is nothing for -T to apply to,
+    # and connect is the one call that is allowed to be interactive.
+    assert "-T" not in ssh.connect_argv(ALIAS)
+
+
+def test_master_alive_uses_the_shared_timeout_by_default():
+    seen = []
+
+    def runner(argv, input_bytes, timeout):
+        seen.append(timeout)
+        return 0, b"", b""
+
+    ssh.master_alive(ALIAS, runner=runner)
+    ssh.master_alive(ALIAS, runner=runner, timeout=45.0)
+
+    # No call in relay waits less than `ssh_timeout`; the local socket check
+    # is fast, but the rule is one number everywhere so nothing can be
+    # accidentally tighter than the rest.
+    assert seen == [ssh.DEFAULT_SSH_TIMEOUT, 45.0]
+    assert ssh.DEFAULT_SSH_TIMEOUT >= 30.0
+
+
+def test_remote_shell_argv_wraps_one_command_string():
+    argv = ssh.remote_shell_argv("squeue --me; echo done")
+
+    assert argv == ["bash", "--noprofile", "--norc", "-c", "squeue --me; echo done"]
+
+
+def test_default_runner_closes_stdin_when_there_is_no_input():
+    # ssh forwards relay's stdin to the remote command; a probe (or a shell
+    # startup file) that reads it would then block until the timeout. With
+    # nothing to send, stdin must be /dev/null. `cat` exits immediately on
+    # an empty stdin and would hang on an inherited terminal.
+    rc, out, _err = ssh._default_runner(["cat"], None, 5.0)
+
+    assert rc == 0
+    assert out == b""
 
 
 def test_build_ssh_argv_passes_remote_words_through_untouched():

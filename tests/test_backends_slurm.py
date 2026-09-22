@@ -13,7 +13,8 @@ compose command lines correctly:
   * **what comes back** -- that scripted Slurm output is turned into the right
     status strings, job IDs and exceptions.
 
-`remote_words()` undoes the quoting `_ssh` applies. ssh has no way to pass an
+`remote_words()` undoes the quoting `_ssh` applies, and the
+`bash --noprofile --norc -c` wrapper relay runs its own probes in. ssh has no way to pass an
 argv vector; it joins everything after the alias with spaces and lets the remote
 *shell* re-split the result. So the test rejoins and re-splits the same way the
 remote shell would, and asserts on the words that would actually arrive. A test
@@ -30,6 +31,7 @@ cluster bearable.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import shlex
@@ -117,11 +119,48 @@ class FakeRunner:
         return len(self.calls)
 
 
-def remote_words(call: dict, alias: str = ALIAS) -> list[str]:
-    """The words the *remote* shell would see, with `_ssh`'s quoting undone."""
+def remote_command(call: dict, alias: str = ALIAS) -> str:
+    """The command line relay's remote shell is asked to run, unwrapped.
+
+    Everything after the alias is one `bash --noprofile --norc -c <command>`
+    argv, quoted for ssh's space-joining. This undoes the quoting the same way
+    the far end would, checks that the four words of relay's clean shell are
+    there and in order, and hands back the `-c` argument -- which is the whole
+    command, whether it is a plain word list or a shell snippet with `;` in it.
+
+    Asserting on the wrapper here rather than in every test means no call can
+    quietly go out through the user's login shell: the helper that every
+    assertion reads through would stop working.
+    """
     argv = call["argv"]
     index = argv.index(alias)
-    return shlex.split(" ".join(argv[index + 1 :]))
+    words = shlex.split(" ".join(argv[index + 1 :]))
+    shell = list(ssh_mod.REMOTE_SHELL)
+    assert words[: len(shell)] == shell, (
+        f"relay's own commands must run in a shell that reads no startup "
+        f"files, but this call went out as {words}"
+    )
+    assert len(words) == len(shell) + 1, (
+        f"the clean shell takes exactly one -c argument, got {words}"
+    )
+    return words[-1]
+
+
+def remote_words(call: dict, alias: str = ALIAS) -> list[str]:
+    """The words the *remote* command line splits into, quoting undone.
+
+    Two layers of quoting sit between a backend call and the far end: relay
+    quotes each word of the command, then quotes the `bash -c` wrapper around
+    it for ssh, which joins everything with spaces and lets a shell re-split
+    it. This undoes both, so a test can assert on the words that would really
+    arrive. Looking at the raw argv instead would pass even if the quoting
+    were wrong in a way the far end could not undo.
+
+    For a shell *snippet* (cancel's marker-then-scancel, read_bytes' `tail`)
+    use `remote_command` -- splitting a snippet into words loses the `;` and
+    the redirects that are the point of it.
+    """
+    return shlex.split(remote_command(call, alias))
 
 
 def assert_alias_is_bare(runner: FakeRunner, alias: str = ALIAS) -> None:
@@ -139,6 +178,10 @@ def assert_alias_is_bare(runner: FakeRunner, alias: str = ALIAS) -> None:
     for call in runner.calls:
         argv = call["argv"]
         assert argv[0] == "ssh"
+        # `-T` is in `expected_options` already, but it is worth its own
+        # assertion with its own message: without it ssh may allocate a pty,
+        # and a pty turns every "\n" relay parses into "\r\n".
+        assert "-T" in argv, f"call asks for a pty: {argv}"
         assert argv[1 : 1 + len(expected_options)] == expected_options, (
             f"call is missing relay's ssh options: {argv}"
         )
@@ -548,10 +591,12 @@ def test_submit_makes_two_round_trips_one_tar_then_sbatch():
     # 1: make the directory and unpack all three files into it, in one
     # command. This replaced two separate `cat >` trips, one per file; the
     # third file (sidecar.json) would have made it three.
-    write = remote_words(runner.calls[0])
-    assert write[:2] == ["sh", "-c"]
-    assert f"mkdir -p {RUN_DIR}" in write[2]
-    assert f"tar -x -C {RUN_DIR}" in write[2]
+    write = remote_command(runner.calls[0])
+    assert f"mkdir -p {RUN_DIR}" in write
+    assert f"tar -x -C {RUN_DIR}" in write
+    # One shell on the far side, not two: the snippet is relay's clean bash's
+    # own `-c` argument, not an `sh -c` nested inside it.
+    assert not write.startswith("sh -c")
 
     # 2: sbatch is pointed at the real file on shared storage, never fed the
     # script on stdin -- the user has to be able to read what was submitted.
@@ -1130,9 +1175,7 @@ def test_cancel_with_a_run_dir_touches_the_marker_before_scancel_in_one_trip():
     backend.cancel("4242", run_dir=RUN_DIR)
 
     assert runner.count == 1, "ordering must not cost an extra round trip"
-    words = remote_words(runner.calls[0])
-    assert words[:2] == ["sh", "-c"]
-    script = words[2]
+    script = remote_command(runner.calls[0])
 
     marker = f"{RUN_DIR}/{CANCEL_FILENAME}"
     assert f"touch {marker}" in script
@@ -1150,7 +1193,7 @@ def test_cancel_with_a_run_dir_touches_the_marker_before_scancel_in_one_trip():
 def test_cancel_with_a_run_dir_quotes_a_path_with_a_space():
     backend, runner = make_backend((0, b"", b""))
     backend.cancel("4242", run_dir="/mmfs1/my runs/vr_s1")
-    assert "'/mmfs1/my runs/vr_s1/CANCEL_REQUESTED'" in remote_words(runner.calls[0])[2]
+    assert "'/mmfs1/my runs/vr_s1/CANCEL_REQUESTED'" in remote_command(runner.calls[0])
 
 
 def test_cancel_with_a_run_dir_still_treats_a_finished_job_as_a_no_op():
@@ -1553,17 +1596,16 @@ def test_read_bytes_tails_from_offset_plus_one():
     assert data == b'{"seq":3}\n'
     assert new_offset == 110
     assert runner.count == 1
-    words = remote_words(runner.calls[0])
-    assert words[:2] == ["sh", "-c"]
-    assert f"tail -c +101 {EVENTS}" in words[2]
-    assert f"[ -f {EVENTS} ]" in words[2]
+    script = remote_command(runner.calls[0])
+    assert f"tail -c +101 {EVENTS}" in script
+    assert f"[ -f {EVENTS} ]" in script
     assert_alias_is_bare(runner)
 
 
 def test_read_bytes_from_the_beginning_asks_for_byte_one():
     backend, runner = make_backend((0, b"hello", b""))
     assert backend.read_bytes(EVENTS, 0) == (b"hello", 5)
-    assert "tail -c +1 " in remote_words(runner.calls[0])[2]
+    assert "tail -c +1 " in remote_command(runner.calls[0])
 
 
 def test_read_bytes_with_nothing_new_returns_the_same_offset():
@@ -1604,7 +1646,7 @@ def test_read_bytes_quotes_a_path_with_a_space():
     backend, runner = make_backend((0, b"x", b""))
     backend.read_bytes("/mmfs1/my runs/events.jsonl", 0)
     # The remote shell must see the path as one word after re-splitting.
-    script = remote_words(runner.calls[0])[2]
+    script = remote_command(runner.calls[0])
     assert "'/mmfs1/my runs/events.jsonl'" in script
 
 
@@ -1660,3 +1702,191 @@ def test_sidecar_path_can_be_overridden(tmp_path: Path):
     assert tar_contents(runner.calls[0]["input"])[SIDECAR_FILENAME] == (
         b"# not the real one\n"
     )
+
+
+# --------------------------------------------------------------------------
+# Timeouts and the shell relay's own commands run in
+# --------------------------------------------------------------------------
+#
+# Two things the first real Klone run got wrong, kept honest here.
+#
+# A round trip through a live ControlMaster measured 4 to 5 seconds on a
+# healthy login node -- not network time, but the time bash spends running
+# `conda init` out of ~/.bashrc before it will run anything relay asked for.
+# Timeout literals of 10 or 15 seconds scattered through the backend were
+# gambling on a good day. So there is now exactly one number, `ssh_timeout`,
+# and any call that needs more takes a *multiple* of it.
+#
+# And relay's own probes now run in a shell that reads no startup files, which
+# is where most of that time went. The training job does not: it needs the
+# user's modules and their conda environment.
+
+
+def drive_every_remote_call(**kwargs) -> tuple[SlurmBackend, FakeRunner]:
+    """Make one of every remote call the backend knows how to make.
+
+    Scripted in the order the calls go out, and `FakeRunner` fails loudly on
+    an unplanned one, so this doubles as a round-trip count: nine calls, nine
+    responses, nothing left over.
+    """
+    backend, runner = make_backend(
+        (0, CKPT_ALL_SCONTROL, b""),  # submit: resolve `auto` off the partition
+        TAR_OK,                       # submit: the tar stream
+        SUBMIT_OK,                    # submit: sbatch
+        (0, b"4242|RUNNING\n", b""),  # status: squeue
+        (0, b"7|COMPLETED\n", b""),   # status: the sacct fallback
+        (0, b"", b""),                # usage: sacct
+        (0, b"", b""),                # cancel: marker then scancel
+        (0, b"hello", b""),           # read_bytes: tail
+        (0, CKPT_ALL_SCONTROL, b""),  # partition_info, a name not yet cached
+        **kwargs,
+    )
+
+    backend.submit(make_spec(requeue_on_term="auto", partition="ckpt-all"))
+    assert backend.status(["4242", "7"]) == {"4242": "running", "7": "completed"}
+    backend.usage(["4242"])
+    backend.cancel("4242", run_dir=RUN_DIR)
+    backend.read_bytes(f"{RUN_DIR}/events.jsonl", 0)
+    backend.partition_info("ckpt-g2")
+
+    assert not runner.responses, "a scripted response went unused"
+    assert runner.count == 9
+    return backend, runner
+
+
+def test_no_remote_call_uses_a_timeout_below_ssh_timeout():
+    """One number, and nothing quietly tighter than it.
+
+    Every operation the backend has, driven through one backend with a
+    non-default `ssh_timeout`, and every call it made is checked. A literal
+    left behind anywhere -- in `_ssh`'s default, in a caller, in a helper --
+    shows up here as a call that would give up sooner than the user asked.
+    """
+    backend, runner = drive_every_remote_call(ssh_timeout=45)
+
+    assert backend.ssh_timeout == 45
+    for index, call in enumerate(runner.calls, start=1):
+        assert call["timeout"] >= 45, (
+            f"remote call #{index} would give up after {call['timeout']}s, "
+            f"sooner than the configured ssh_timeout of 45s: "
+            f"{remote_command(call)}"
+        )
+
+    # sbatch, and only sbatch, asks for more: it waits on slurmctld rather
+    # than on the login node. A multiple of the configured value, never a
+    # literal, so raising ssh_timeout raises this too.
+    sbatch_call = next(
+        call for call in runner.calls if remote_command(call).startswith("sbatch ")
+    )
+    assert sbatch_call["timeout"] == slurm_mod.SBATCH_TIMEOUT_FACTOR * 45
+
+
+def test_the_default_timeout_is_the_shared_one_everywhere():
+    """With nothing configured, every call uses relay's one default."""
+    backend, runner = drive_every_remote_call()
+
+    assert backend.ssh_timeout == ssh_mod.DEFAULT_SSH_TIMEOUT
+    for call in runner.calls:
+        assert call["timeout"] >= ssh_mod.DEFAULT_SSH_TIMEOUT, (
+            f"a default backend gave up sooner than relay's own default on "
+            f"{remote_command(call)}"
+        )
+
+
+def test_probe_commands_run_in_a_clean_shell():
+    """relay's own commands skip the user's shell startup files.
+
+    Not a style preference: on Klone the measured 4 to 5 seconds of a round
+    trip is mostly `conda init` running in ~/.bashrc, and relay runs these
+    commands several times a minute. `-T` belongs to the same argv for a
+    different reason -- a pty would rewrite the newlines relay parses.
+
+    The caveat this cannot check: sshd still starts a login shell to run what
+    relay sends, and on a bash built with SSH_SOURCE_BASHRC that outer shell
+    sources ~/.bashrc before reaching our `bash --norc`. Nothing on this side
+    can prevent that; doctor's slow round-trip warning is what surfaces it.
+    """
+    _backend, runner = drive_every_remote_call()
+    assert_alias_is_bare(runner)
+
+    shell = list(ssh_mod.REMOTE_SHELL)
+    for call in runner.calls:
+        argv = call["argv"]
+        assert "-T" in argv, f"call would allocate a pty: {argv}"
+
+        # The four words, in order, immediately after the alias -- and then
+        # exactly one more, the command. `remote_command` asserts all of that
+        # and returns the command; calling it is the check.
+        command = remote_command(call)
+        assert command, f"empty remote command in {argv}"
+
+        index = argv.index(ALIAS)
+        words = shlex.split(" ".join(argv[index + 1 :]))
+        assert words[: len(shell)] == shell
+        assert words[len(shell) :] == [command]
+
+        # One shell layer, not two. The snippets used to be wrapped in
+        # `sh -c` as well, which forked a second shell to run one `tail`.
+        assert not command.startswith("sh -c")
+
+
+def test_the_training_job_does_not_get_the_clean_shell():
+    """The clean shell is for relay's probes only.
+
+    The training job needs the user's environment -- their `module load`, their
+    `conda activate` -- so nothing in the rendered script may strip it. The
+    `setup` lines run under the job's own bash, and the exec line is byte for
+    byte the one the golden test pins.
+    """
+    spec = make_spec(
+        time_limit="12:00:00",
+        grace_seconds=90,
+        gres="gpu:a40:1",
+        sbatch_extra=["--mem=64G", "--cpus-per-task=8", '--constraint "a40|l40"'],
+        setup=["module load cuda/12.4", "source ~/envs/rl/bin/activate"],
+        env={"WANDB_MODE": "offline"},
+    )
+    script = render_sbatch(
+        spec,
+        remote_python="/sw/py/bin/python",
+        account="mlopt",
+        partition="ckpt-all",
+    )
+
+    # The two flags that would cut the user's environment out. (`bash` itself
+    # appears, as the script's own shebang, which is exactly as it should be.)
+    assert "--noprofile" not in script
+    assert "--norc" not in script
+
+    # Byte for byte the exec line the golden test pins, so this test fails if
+    # anything at all is added to the sidecar's command.
+    exec_line = (
+        f"exec /sw/py/bin/python {RUN_DIR}/sidecar.py "
+        f"--run vr_s1_7f3a --dir {RUN_DIR} --grace 90 --heartbeat 30 "
+        f"-- python train.py --lr 3e-4"
+    )
+    assert exec_line in script
+    assert script == SAMPLE_SCRIPT.format(run_dir=RUN_DIR, exec_line=exec_line)
+
+
+def test_from_config_reads_ssh_timeout():
+    """Depends on `Config.ssh_timeout`, which config.py owns.
+
+    Written to pass either way: with the key present the backend must carry
+    the configured number, and without it the shared default. Once the key
+    exists this is a real assertion about config reaching the backend.
+    """
+    fields = {
+        "backend": "slurm",
+        "ssh_alias": ALIAS,
+        "remote_root": REMOTE_ROOT,
+    }
+    config_fields = {f.name for f in dataclasses.fields(Config)}
+    if "ssh_timeout" in config_fields:
+        fields["ssh_timeout"] = 45
+        expected = 45
+    else:  # pragma: no cover - only before config.py grows the key
+        expected = ssh_mod.DEFAULT_SSH_TIMEOUT
+
+    backend = SlurmBackend.from_config(Config(**fields))
+    assert backend.ssh_timeout == expected

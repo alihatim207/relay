@@ -18,11 +18,13 @@ would overwrite) the developer's real state.
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import os
 import stat
 import textwrap
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -129,6 +131,25 @@ DF_ROOMY = "gpfs1 1073741824 863986624 209715200 81% /mmfs1"
 DF_TIGHT = "gpfs1 1073741824 1068547072 5194752 99% /mmfs1"  # ~5 GiB
 
 
+class SshCall(NamedTuple):
+    """One recorded call to the faked `_ssh` / `_ssh_master_check`.
+
+    `timeout` is recorded because it is now load-bearing: every remote call in
+    doctor must wait at least the configured `ssh_timeout`, and a check that
+    quietly kept a tighter literal of its own is exactly the bug that made a
+    healthy-but-slow login node look unreachable.
+    """
+
+    alias: str
+    command: str
+    timeout: float
+
+
+def commands_of(calls: list[SshCall], needle: str = "") -> list[str]:
+    """The recorded command lines, optionally only those containing `needle`."""
+    return [call.command for call in calls if needle in call.command]
+
+
 def install_ssh(monkeypatch, table: dict[str, doctor.SshResult], default=None, calls=None):
     """Install fake `_ssh` and `_ssh_master_check` that answer by substring.
 
@@ -137,14 +158,18 @@ def install_ssh(monkeypatch, table: dict[str, doctor.SshResult], default=None, c
     KillWait probe. The master check has no remote command at all, so it is
     recorded and matched as the literal "-O check".
 
+    These stubs stand in for `_ssh` itself, so what they see is the *unwrapped*
+    command -- the `bash --noprofile --norc -c` wrapping happens inside the real
+    `_ssh`, which is where its own tests look for it.
+
     `table` is an ordinary dict and matching walks it in insertion order, so a
     narrow needle ("show config") must be listed before a broad one that also
     matches it ("scontrol").
     """
 
-    def _answer(alias, command):
+    def _answer(alias, command, timeout):
         if calls is not None:
-            calls.append((alias, command))
+            calls.append(SshCall(alias, command, timeout))
         for needle, result in table.items():
             if needle in command:
                 return result
@@ -152,11 +177,11 @@ def install_ssh(monkeypatch, table: dict[str, doctor.SshResult], default=None, c
             return default
         raise AssertionError(f"no fake SSH response for command: {command!r}")
 
-    def _fake(alias, args, timeout=doctor.SSH_TIMEOUT_SECONDS):
-        return _answer(alias, " ".join(args))
+    def _fake(alias, args, timeout=ssh_mod.DEFAULT_SSH_TIMEOUT):
+        return _answer(alias, " ".join(args), timeout)
 
-    def _fake_master(alias, timeout=doctor.SSH_TIMEOUT_SECONDS):
-        return _answer(alias, "-O check")
+    def _fake_master(alias, timeout=ssh_mod.DEFAULT_SSH_TIMEOUT):
+        return _answer(alias, "-O check", timeout)
 
     monkeypatch.setattr(doctor, "_ssh", _fake)
     monkeypatch.setattr(doctor, "_ssh_master_check", _fake_master)
@@ -348,9 +373,9 @@ def test_ssh_carries_relays_control_options_and_a_bare_alias(monkeypatch):
     argv = seen["argv"]
     # Identical to what the backend and the daemon use. doctor testing a
     # different connection from the one relay actually opens would be useless.
-    assert argv == ssh_mod.build_ssh_argv("klone", ["true"])
+    assert argv == ssh_mod.build_ssh_argv("klone", ssh_mod.remote_shell_argv("true"))
     assert argv[0] == "ssh"
-    assert argv[-2:] == ["klone", "true"]
+    assert argv[-6:] == ["klone", "bash", "--noprofile", "--norc", "-c", "true"]
     assert "@" not in " ".join(argv)
 
     options = [argv[i + 1] for i, word in enumerate(argv) if word == "-o"]
@@ -362,9 +387,52 @@ def test_ssh_carries_relays_control_options_and_a_bare_alias(monkeypatch):
         "ServerAliveCountMax=3",
         "BatchMode=yes",
     ]
-    assert seen["kwargs"]["timeout"] == doctor.SSH_TIMEOUT_SECONDS
+    assert seen["kwargs"]["timeout"] == ssh_mod.DEFAULT_SSH_TIMEOUT
     assert result.succeeded()
     assert result.duration_ms >= 0
+
+
+def test_doctor_probes_run_under_a_clean_remote_shell(monkeypatch):
+    """`bash --noprofile --norc -c`, so no startup file runs for a probe.
+
+    The whole reason a round trip to Klone costs seconds is that a shell starts
+    first, and `conda init` in ~/.bashrc is not free. None of relay's probes
+    (`true`, `command -v sbatch`, `df`) needs anything a startup file sets up,
+    so none of them should pay for one. This cannot skip the login shell sshd
+    itself spawns, which is why the slow-round-trip warning still exists.
+    """
+    seen = record_subprocess(monkeypatch)
+
+    REAL_SSH("klone", ["command", "-v", "sbatch"])
+
+    argv = seen["argv"]
+    assert "bash --noprofile --norc -c" in " ".join(argv)
+    # The whole command is one argv word, quoted: ssh joins these with spaces
+    # and the remote login shell re-parses the result.
+    assert argv[-5:] == ["bash", "--noprofile", "--norc", "-c", "'command -v sbatch'"]
+
+
+def test_the_remote_root_probe_survives_being_wrapped(monkeypatch):
+    """The probe is a whole shell script, semicolons and all.
+
+    Without quoting, the remote *login* shell would eat the `;` and the `if`
+    before bash ever saw them, and the probe would run in pieces.
+    """
+    seen = record_subprocess(monkeypatch)
+    probe = doctor._REMOTE_ROOT_PROBE.format(
+        root="'/mmfs1/gscratch/mlopt/you/relay'",
+        no_dir=doctor._NO_DIR,
+        no_write=doctor._NO_WRITE,
+        ok=doctor._ROOT_OK,
+    )
+
+    REAL_SSH("klone", [probe])
+
+    argv = seen["argv"]
+    assert argv[-5:-1] == ["bash", "--noprofile", "--norc", "-c"]
+    # One word, and the script -- semicolons included -- is inside it.
+    assert doctor._NO_DIR in argv[-1]
+    assert argv[-1].startswith("'") and argv[-1].endswith("'")
 
 
 def test_master_check_uses_relays_control_path_and_no_remote_command(monkeypatch):
@@ -434,19 +502,116 @@ def test_fast_ssh_is_ok(monkeypatch):
     assert checks["ssh"].duration_ms is not None
 
 
-def test_slow_ssh_warns_about_controlmaster(monkeypatch):
+# The four branches of the ssh check. Which one fires depends on *two* facts,
+# never on the clock alone: did the round trip work, and is relay's master
+# alive? Reading the clock by itself is what produced a confident, false
+# "ssh opened a fresh connection" on a host whose master was up the whole time.
+
+
+def test_a_round_trip_slower_than_a_second_but_under_the_timeout_is_ok(monkeypatch):
+    """Klone's real number, roughly: 4.8s through a live master, and fine.
+
+    This is the measurement that used to be reported as a broken
+    ControlMaster. Five seconds is what a login node costs when every shell
+    runs `conda init` first; it is slow, not wrong, and well inside the 30s
+    relay is willing to wait.
+    """
     write_slurm_config()
     table = healthy_ssh_table()
-    # 9 seconds: a real round trip, but one that clearly re-authenticated.
-    table["true"] = ssh_ok(duration_ms=9000.0)
+    table["true"] = ssh_ok(duration_ms=5000.0)
+    install_ssh(monkeypatch, table)
+
+    result = by_name(doctor.run_checks())["ssh"]
+
+    assert result.status == doctor.OK
+    assert "5.0s" in result.detail
+    assert "ControlMaster" not in result.detail
+
+
+def test_twenty_seconds_still_passes_on_the_default_timeout(monkeypatch):
+    """The threshold is ssh_timeout itself, so 20 < 30 is not worth a word."""
+    write_slurm_config()
+    table = healthy_ssh_table()
+    table["true"] = ssh_ok(duration_ms=20_000.0)
+    install_ssh(monkeypatch, table)
+
+    assert by_name(doctor.run_checks())["ssh"].status == doctor.OK
+
+
+def test_slow_round_trip_with_a_live_master_blames_shell_startup(monkeypatch):
+    """The fix. With a master up, the only honest culprit is the far end."""
+    write_slurm_config()
+    table = healthy_ssh_table()
+    table["true"] = ssh_ok(duration_ms=31_000.0)
     install_ssh(monkeypatch, table)
 
     checks = by_name(doctor.run_checks())
+    detail = checks["ssh"].detail
 
     assert checks["ssh"].status == doctor.WARN
-    assert "ControlMaster" in checks["ssh"].detail
-    # A slow connection still works, so the checks behind it are not skipped.
+    assert "31.0s" in detail
+    assert "shell startup" in detail
+    assert "~/.bashrc" in detail
+    assert "ssh_timeout" in detail
+    # The two claims that were false: nothing was re-negotiated, and there is
+    # nothing for `relay connect` to fix.
+    assert "fresh connection" not in detail
+    assert "relay connect" not in detail
+    # Slow is not broken: the checks behind it still ran.
     assert checks["sbatch"].status == doctor.OK
+    assert checks["remote_root"].status == doctor.OK
+    # And a warning does not fail the run.
+    assert doctor.worst_status(list(checks.values())) == 0
+
+
+def test_slow_round_trip_with_no_master_does_blame_the_connection(monkeypatch):
+    """Here the old sentence was right, and it stays."""
+    write_slurm_config()
+    table = no_master_table()
+    table["true"] = ssh_ok(duration_ms=31_000.0)
+    install_ssh(monkeypatch, table)
+
+    checks = by_name(doctor.run_checks())
+    detail = checks["ssh"].detail
+
+    assert checks["ssh"].status == doctor.WARN
+    assert "fresh connection" in detail
+    assert "relay connect" in detail
+    # Still only a warning, so the remote checks behind it are not skipped.
+    assert checks["sbatch"].status == doctor.OK
+
+
+def test_ssh_failure_with_a_live_master_points_at_the_timeout(monkeypatch):
+    """A master is up, so a failure cannot be an authentication problem.
+
+    Nothing here may say `relay connect` -- including the sentence the timeout
+    itself produces, which used to carry that guess inside its own message.
+    """
+    write_slurm_config()
+    table = healthy_ssh_table()
+    table["true"] = ssh_transport_failure("ssh did not answer within 30 seconds")
+    install_ssh(monkeypatch, table)
+
+    result = by_name(doctor.run_checks())["ssh"]
+
+    assert result.status == doctor.ERROR
+    assert "ssh_timeout" in result.detail
+    assert "did not answer" in result.detail
+    assert "relay connect" not in result.detail
+
+
+def test_the_timeout_message_itself_does_not_guess_at_a_cause(monkeypatch):
+    """`_run_ssh` has no idea whether a master is alive, so it must not say."""
+
+    def fake_run(argv, **kwargs):
+        raise doctor.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+
+    result = REAL_SSH("klone", ["true"], timeout=30)
+
+    assert "did not answer within 30 seconds" in result.message()
+    assert "relay connect" not in result.message()
 
 
 def test_failed_ssh_is_an_error_and_later_remote_checks_skip(monkeypatch):
@@ -680,12 +845,12 @@ def test_master_absent_warns_and_says_to_run_relay_connect(monkeypatch):
 def test_master_runs_before_the_ssh_round_trip(monkeypatch):
     """Order matters: the ssh check reads the master check's answer."""
     write_slurm_config()
-    calls: list[tuple[str, str]] = []
+    calls: list[SshCall] = []
     install_ssh(monkeypatch, healthy_ssh_table(), calls=calls)
 
     doctor.run_checks()
 
-    commands = [cmd for _, cmd in calls]
+    commands = commands_of(calls)
     assert commands.index("-O check") < commands.index("true")
 
 
@@ -701,6 +866,8 @@ def test_failed_ssh_points_at_relay_connect_when_no_master_is_up(monkeypatch):
     # The round trip still ran; BatchMode makes it fail rather than hang.
     assert checks["ssh"].status == doctor.ERROR
     assert "relay connect" in checks["ssh"].detail
+    # ssh prints its own reason last, and that line is what names the problem.
+    assert "Permission denied (publickey,keyboard-interactive)." in checks["ssh"].detail
     assert checks["master"].status == doctor.WARN
 
 
@@ -781,12 +948,12 @@ def test_account_mismatch_warns_and_lists_what_was_found(monkeypatch):
 
 def test_account_check_uses_remote_whoami_not_a_local_username(monkeypatch):
     write_slurm_config()
-    calls: list[tuple[str, str]] = []
+    calls: list[SshCall] = []
     install_ssh(monkeypatch, healthy_ssh_table(), calls=calls)
 
     doctor.run_checks()
 
-    account_commands = [cmd for _, cmd in calls if "sacctmgr" in cmd]
+    account_commands = commands_of(calls, "sacctmgr")
     assert account_commands, "the account check never ran"
     # $(whoami) is expanded by the remote shell; nothing local is baked in.
     assert "$(whoami)" in account_commands[0]
@@ -982,14 +1149,14 @@ def test_the_safe_combinations_are_ok(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def config_commands(calls: list[tuple[str, str]]) -> list[str]:
-    return [cmd for _, cmd in calls if "show config" in cmd]
+def config_commands(calls: list[SshCall]) -> list[str]:
+    return commands_of(calls, "show config")
 
 
 def test_grace_time_zero_falls_back_to_cluster_kill_wait(monkeypatch):
     """Klone's shape: GraceTime=0, KillWait=10, so the window is 10 seconds."""
     write_slurm_config(preempt_grace=10)
-    calls: list[tuple[str, str]] = []
+    calls: list[SshCall] = []
     install_ssh(monkeypatch, healthy_ssh_table(), calls=calls)
 
     result = by_name(doctor.run_checks())["preempt_window"]
@@ -1015,7 +1182,7 @@ def test_preempt_grace_longer_than_the_window_warns_with_the_value_to_set(monkey
 def test_a_real_grace_time_wins_and_kill_wait_is_never_asked_for(monkeypatch):
     """One fewer SSH round trip when the partition already answered."""
     write_slurm_config(preempt_grace=10)
-    calls: list[tuple[str, str]] = []
+    calls: list[SshCall] = []
     install_ssh(monkeypatch, partition_table(PREEMPTIBLE), calls=calls)
 
     result = by_name(doctor.run_checks())["preempt_window"]
@@ -1170,12 +1337,12 @@ def test_remote_root_not_writable_is_an_error(monkeypatch):
 def test_remote_root_probe_quotes_the_path(monkeypatch):
     """A path with a space must survive being re-parsed by the remote shell."""
     write_slurm_config(remote_root="/mmfs1/gscratch/my lab/relay")
-    calls: list[tuple[str, str]] = []
+    calls: list[SshCall] = []
     install_ssh(monkeypatch, healthy_ssh_table(), calls=calls)
 
     doctor.run_checks()
 
-    probes = [cmd for _, cmd in calls if doctor._NO_DIR in cmd]
+    probes = commands_of(calls, doctor._NO_DIR)
     assert probes
     assert "'/mmfs1/gscratch/my lab/relay'" in probes[0]
 
@@ -1485,6 +1652,82 @@ def test_a_fully_healthy_slurm_run_exits_zero(monkeypatch):
     finally:
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
         holder.close()
+
+
+def test_no_remote_call_waits_less_than_the_configured_ssh_timeout(monkeypatch):
+    """One number for the whole of relay, and every check must use it.
+
+    This is the regression guard for the shape of the original bug: doctor kept
+    a 15 second literal of its own, tighter than anything else in relay, and a
+    login node that answered in 4.8 seconds through a live master still failed
+    the check outright -- which skipped all ten remote checks behind it. A
+    per-check literal is the only way that can come back, so assert on every
+    recorded call rather than on the two that happen to be interesting.
+    """
+    write_slurm_config()
+    calls: list[SshCall] = []
+    install_ssh(monkeypatch, healthy_ssh_table(), calls=calls)
+
+    doctor.run_checks()
+
+    expected = ssh_mod.DEFAULT_SSH_TIMEOUT
+    assert expected >= 30.0  # the floor the Klone measurement set
+    assert calls, "no remote call was recorded"
+    for call in calls:
+        assert call.timeout >= expected, call
+
+    # The round trip gets double, because the same number is the threshold
+    # above which it *warns*. Cut it off at the threshold and a slow-but-alive
+    # login node could only ever be reported as an error.
+    round_trips = [call for call in calls if call.command == "true"]
+    assert len(round_trips) == 1
+    assert round_trips[0].timeout >= 2 * expected
+
+    # Including the local socket probe: it answers in milliseconds, but nothing
+    # in relay waits less than the shared value.
+    master_checks = [call for call in calls if call.command == "-O check"]
+    assert master_checks and master_checks[0].timeout >= expected
+
+
+def test_a_configured_ssh_timeout_is_what_every_call_uses(monkeypatch):
+    """Raising `ssh_timeout` has to reach the checks, not just the daemon."""
+    if "ssh_timeout" not in {f.name for f in dataclasses.fields(cfg.Config)}:
+        pytest.skip("Config.ssh_timeout has not landed yet")
+
+    write_config(
+        "backend: slurm\n"
+        "ssh_alias: testcluster\n"
+        "remote_root: /mmfs1/gscratch/mlopt/you/relay\n"
+        "remote_python: python3\n"
+        "ssh_timeout: 90\n"
+        "slurm:\n"
+        "  account: mlopt\n"
+        "  partition: gpu-a40\n"
+        '  time: "04:00:00"\n'
+    )
+    calls: list[SshCall] = []
+    install_ssh(monkeypatch, healthy_ssh_table(), calls=calls)
+
+    doctor.run_checks()
+
+    assert calls
+    for call in calls:
+        assert call.timeout >= 90.0, call
+    assert [c for c in calls if c.command == "true"][0].timeout >= 180.0
+
+
+def test_a_config_without_ssh_timeout_falls_back_to_the_shared_default():
+    """`getattr`, so a hand-built Config still works and is never tighter."""
+
+    class Bare:
+        pass
+
+    assert doctor._ssh_timeout(Bare()) == ssh_mod.DEFAULT_SSH_TIMEOUT
+    # Nonsense is a fallback too: a health check may not be the thing that dies.
+    for bad in (None, 0, -5, "soon"):
+        holder = Bare()
+        holder.ssh_timeout = bad
+        assert doctor._ssh_timeout(holder) == ssh_mod.DEFAULT_SSH_TIMEOUT
 
 
 def test_results_are_json_friendly(monkeypatch):

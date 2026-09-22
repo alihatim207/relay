@@ -771,24 +771,43 @@ def test_a_failed_usage_call_does_not_block_ingest(store, backend, tmp_path):
 
 @pytest.fixture()
 def master(monkeypatch):
-    """Control what `ssh -O check` reports, and count how often we ask it.
+    """Control what `ssh -O check` reports, and record every call to it.
 
     The daemon calls `ssh.master_alive`, so patching the attribute on the
     module object is enough -- no socket, no subprocess, no Duo.
+
+    The recorder keeps each call's `timeout`, and the teardown below asserts
+    that no test in this file ever saw the daemon pass one under
+    `ssh.DEFAULT_SSH_TIMEOUT`. That is the whole point of consolidating on a
+    single `ssh_timeout`: a call that quietly used a tighter literal of its own
+    would give up on a login node that every other call in relay is still
+    waiting patiently for, and nothing but an assertion like this would notice.
     """
 
     class FakeMaster:
         def __init__(self) -> None:
             self.alive = False
             self.calls = 0
+            # One entry per call, in order: the `timeout` the daemon passed.
+            self.timeouts: list[float | None] = []
 
-        def __call__(self, alias, runner=None):
+        def __call__(self, alias, runner=None, timeout=None):
             self.calls += 1
+            self.timeouts.append(timeout)
             return self.alive
 
     fake = FakeMaster()
     monkeypatch.setattr(ssh_module, "master_alive", fake)
-    return fake
+    yield fake
+
+    assert all(
+        isinstance(t, (int, float)) and t >= ssh_module.DEFAULT_SSH_TIMEOUT
+        for t in fake.timeouts
+    ), (
+        f"the daemon called master_alive with {fake.timeouts}; every remote "
+        f"call must use the backend's ssh_timeout, never a literal tighter "
+        f"than {ssh_module.DEFAULT_SSH_TIMEOUT}s"
+    )
 
 
 def in_auth_required(store: Store) -> None:
@@ -970,6 +989,74 @@ def test_shrinking_the_check_interval_checks_every_cycle(store, backend, master)
     daemon.run_once()
 
     assert master.calls == 2
+
+
+# --------------------------------------------------------------------------
+# One timeout everywhere: the socket check uses the backend's ssh_timeout
+# --------------------------------------------------------------------------
+
+
+def test_the_auth_gate_checks_the_socket_with_the_backends_ssh_timeout(
+    store, backend, master
+):
+    """The lockout gate's `ssh -O check` waits as long as the config says.
+
+    `ssh_timeout` is one number for the whole of relay, and the backend is
+    where it lives (it is the thing that owns the connection). The daemon must
+    read it off the backend rather than pass a number of its own, so a user who
+    raises the timeout for a slow login node raises it for every call relay
+    makes, this one included.
+    """
+    backend.ssh_alias = "klone"
+    backend.ssh_timeout = 45
+    master.alive = False
+    in_auth_required(store)
+
+    stats = Daemon(store, backend).run_once()
+
+    assert stats.auth_required
+    assert master.timeouts == [45]
+
+
+def test_classifying_a_failure_checks_the_socket_with_the_backends_ssh_timeout(
+    store, backend, master
+):
+    """The other `master_alive` call site -- failure classification -- too.
+
+    This is the call that decides between `auth_required` and `unreachable`,
+    and it runs in exactly the circumstances where the login node is unwell. A
+    shorter timeout here would report "no master" for a master that was merely
+    slow to answer, and send the user off to run `relay connect` for nothing.
+    """
+    backend.ssh_alias = "klone"
+    backend.ssh_timeout = 45
+    master.alive = True
+    store.create_run("vr_x", backend="fake", job_id="7", status="queued")
+    backend.status_error = TransportError("ssh exited 255", returncode=255, stderr="")
+
+    Daemon(store, backend).run_once()
+
+    assert store.get_daemon_state()["last_error_kind"] == "unreachable"
+    assert master.timeouts == [45]
+
+
+def test_a_backend_with_no_ssh_timeout_falls_back_to_the_default(store, backend, master):
+    """A backend that never heard of `ssh_timeout` still gets a sane number.
+
+    `SlurmBackend` carries the attribute; a hand-rolled or older backend need
+    not, and the daemon must not raise `AttributeError` on one. The fallback is
+    the same default the config uses, so nothing silently gets its own idea of
+    how long is too long.
+    """
+    backend.ssh_alias = "klone"
+    assert not hasattr(backend, "ssh_timeout")
+    master.alive = False
+    in_auth_required(store)
+
+    Daemon(store, backend).run_once()
+
+    assert master.timeouts == [ssh_module.DEFAULT_SSH_TIMEOUT]
+    assert ssh_module.DEFAULT_SSH_TIMEOUT == 30.0
 
 
 # --------------------------------------------------------------------------

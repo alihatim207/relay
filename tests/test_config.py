@@ -109,6 +109,7 @@ def test_init_output_round_trips_with_every_default_intact():
         ssh_alias=None,
         remote_root=None,
         remote_python="python3",
+        ssh_timeout=30,
         local_root=str(cfg.data_dir() / "runs"),
         requeue_on_term="auto",
         preempt_grace=10,
@@ -757,6 +758,88 @@ def test_preempt_grace_boolean_raises():
     write_config("preempt_grace: yes\n")
     with pytest.raises(cfg.ConfigError):
         cfg.load()
+
+
+# --------------------------------------------------------------------------
+# load: ssh_timeout
+# --------------------------------------------------------------------------
+
+
+def test_ssh_timeout_defaults_to_thirty_when_omitted():
+    write_config("backend: local\n")
+    assert cfg.load().ssh_timeout == 30
+
+
+def test_ssh_timeout_null_is_the_default():
+    write_config("ssh_timeout:\n")
+    assert cfg.load().ssh_timeout == 30
+
+
+def test_ssh_timeout_default_comes_from_relay_ssh():
+    # One number, defined next to the measurement that justifies it. If ssh.py
+    # ever changes it, config must follow rather than keep its own copy.
+    from relay import ssh
+
+    assert cfg.DEFAULT_SSH_TIMEOUT == int(ssh.DEFAULT_SSH_TIMEOUT)
+    assert cfg.Config().ssh_timeout == int(ssh.DEFAULT_SSH_TIMEOUT)
+
+
+def test_ssh_timeout_accepts_an_integer():
+    write_config("ssh_timeout: 45\n")
+    assert cfg.load().ssh_timeout == 45
+
+
+def test_ssh_timeout_below_the_floor_raises():
+    # A round trip through a live ControlMaster on Klone measured 4 to 5
+    # seconds, all of it the login node starting a shell. At 4 relay would time
+    # out commands that were about to succeed and call a healthy cluster dead,
+    # so the error has to explain where the floor comes from.
+    write_config("ssh_timeout: 4\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "ssh_timeout" in message
+    assert "floor" in message
+    assert "round trip" in message
+    assert "login node" in message
+
+
+def test_ssh_timeout_five_is_the_lowest_accepted():
+    write_config("ssh_timeout: 5\n")
+    assert cfg.load().ssh_timeout == 5
+
+
+def test_ssh_timeout_boolean_raises():
+    # isinstance(True, int) is True, so `ssh_timeout: yes` would sail through a
+    # naive int check as a one-second budget.
+    write_config("ssh_timeout: yes\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    assert "whole number" in str(exc.value)
+
+
+def test_ssh_timeout_rejects_a_float():
+    # 30.5 means the user thinks this is a network latency. It is not, and
+    # rounding it silently would leave them believing it.
+    write_config("ssh_timeout: 30.5\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    assert "ssh_timeout" in str(exc.value)
+
+
+def test_ssh_timeout_rejects_a_string():
+    write_config('ssh_timeout: "30s"\n')
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    assert "whole number" in str(exc.value)
+
+
+def test_starter_config_documents_ssh_timeout():
+    # A user only raises this after doctor complains, so the file has to say
+    # what the number actually measures.
+    text = cfg.STARTER_CONFIG
+    assert "ssh_timeout" in text
+    assert "login node" in text
 
 
 # --------------------------------------------------------------------------

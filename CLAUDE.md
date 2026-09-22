@@ -115,7 +115,7 @@ On Klone the entire window from SIGTERM to SIGKILL is 10 seconds and preemption 
 
 YAML at `~/.config/relay/config.yaml`, written by `relay init` with every key documented and commented out. Store the SSH alias, never `user@host`.
 
-Top level: `backend` (`local` | `slurm`), `ssh_alias`, `remote_root`, `remote_python`, `local_root`, `requeue_on_term` (`auto` | `always` | `never`), `preempt_grace` (seconds, default 10), `setup`, `slurm:`, `cost:`, `resume:`.
+Top level: `backend` (`local` | `slurm`), `ssh_alias`, `remote_root`, `remote_python`, `local_root`, `ssh_timeout` (seconds, default 30, minimum 5), `requeue_on_term` (`auto` | `always` | `never`), `preempt_grace` (seconds, default 10), `setup`, `slurm:`, `cost:`, `resume:`.
 
 `resume:` section: `checkpoint_glob` and `arg`, both or neither; `arg` must contain `{path}`. See Resume under the sidecar section. Per-run: `relay submit --checkpoint-glob ... --resume-arg ...` replaces both.
 
@@ -186,6 +186,14 @@ Command-line `-o` options override `~/.ssh/config`, so this works whether or not
 ssh does not create the ControlPath's parent directory; it fails with `unix_listener: cannot bind to path ...: No such file or directory` after Duo has already been answered. So every argv builder in `ssh.py` calls `ensure_control_dir()` first: `makedirs` with mode 0700, then `chmod` to 0700 if it already existed looser. That covers `connect`, the daemon, doctor, and the backend by construction; the daemon and doctor can run before `connect` ever has. `doctor` reports the directory's state as its own check. A fake ssh runner cannot catch this class of bug because the bind happens inside the real ssh binary, which is why `tests/test_ssh_integration.py` runs a real `ssh -M -N -f` against localhost when a local sshd is available and skips otherwise.
 
 When ssh exits 255, relay's error carries the last line of ssh's stderr. The generic "check that `ssh <alias>` works" advice appears only when stderr is empty.
+
+### Timeouts and latency
+
+A round trip through a live ControlMaster on Klone takes 4 to 5 seconds. None of that is network: the login node is slow to start a shell (a `conda init` in `~/.bashrc` on a shared, busy node). A loaded login node is much worse. So the floor to plan for is about 5 seconds per round trip, and latency alone is never evidence that ssh opened a new connection.
+
+One configurable value, `ssh_timeout` (default 30, minimum 5), is the budget for every remote call in `SlurmBackend`, the daemon, and doctor. No remote call anywhere uses a literal timeout of its own or waits less than `ssh_timeout`; a call that genuinely needs longer uses a documented multiple of it.
+
+Relay's own probe commands run with `ssh -T`, stdin closed, and `bash --noprofile --norc -c` so the user's shell startup files are skipped where relay controls the command. This cleans the inner shell only: sshd still spawns the user's login shell to run the command, and some bash builds source `~/.bashrc` on every SSH invocation, which is exactly the cost doctor's warning points at. Never applied to the training job, which runs under Slurm in the user's own environment.
 
 `BatchMode=yes` is essential: without it, a missing master makes ssh wait forever for a Duo prompt nobody will see, hanging the daemon.
 
@@ -271,7 +279,9 @@ A usage panel shows totals, the partition split, and the wasted-hours breakdown.
 
 Run every check, never fail fast, report all results. Exit 0 on warnings, nonzero on errors, so it works as a CI smoke test.
 
-Checks: config exists and parses; SSH reaches the host and how long it took; relay's master socket is alive (`ssh -O check` with relay's ControlPath; if not, say "Run `relay connect`"); remote Python exists at the configured path; `sbatch` on PATH; Slurm account valid; partition exists and its `PreemptMode`, `GraceTime`, `MaxTime`; `remote_root` exists, is writable, free space; database present and in WAL mode; the `usage` table exists and when usage was last fetched; daemon holds its lock and when it last completed a cycle.
+Checks: config exists and parses; the ControlPath directory exists with mode 0700; relay's master socket is alive (`ssh -O check` with relay's ControlPath; if not, say "Run `relay connect`"); SSH reaches the host and how long it took; remote Python exists at the configured path; `sbatch` on PATH; Slurm account valid; partition exists and its `PreemptMode`, `GraceTime`, `MaxTime`; `remote_root` exists, is writable, free space; database present and in WAL mode; the `usage` table exists and when usage was last fetched; daemon holds its lock and when it last completed a cycle.
+
+The ssh check never infers a cause from latency alone. It already knows from the master check whether the master is alive. Master alive and the round trip slow: warn that the login node is slow to respond and that remote shell startup (for example `conda init` in `~/.bashrc`) is the usual reason; make no claim about a fresh connection and do not suggest `relay connect`. Master absent: keep the `relay connect` suggestion. The slow threshold is `ssh_timeout`; the check's own subprocess timeout is twice that, so a slow round trip can still complete and warn rather than being cut off as an error. A failed ssh check still skips the remote checks that depend on it; a warning does not.
 
 Partition follow-ups: warn if `PreemptMode` includes REQUEUE and config says `requeue_on_term: always` (double requeue risk). Warn if `PreemptMode` lacks REQUEUE and `requeue_on_term` is `never` (preempted runs will not come back). If `GraceTime` is 0, also read `KillWait` from `scontrol show config` and report that as the effective grace. Warn if the configured `preempt_grace` exceeds the effective grace (the sidecar would plan for time it does not have), and print the value to set. Warn if the configured time limit exceeds `MaxTime`.
 

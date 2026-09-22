@@ -56,6 +56,38 @@ SERVER_ALIVE_COUNT_MAX = "3"
 AUTH_REQUIRED = "auth_required"
 UNREACHABLE = "unreachable"
 
+# How long one remote round trip may take before relay gives up on it.
+#
+# This is not a network number. Through a live ControlMaster there is no
+# handshake at all; what takes the time is the login node starting a shell
+# for the command, and on Klone that measured 4 to 5 seconds with the master
+# already open (a `conda init` in ~/.bashrc, run by a shared and busy node).
+# A loaded login node is much worse. So the floor to plan for is about 5
+# seconds per round trip, and 30 leaves room for a bad day without letting
+# the daemon hang on a dead socket for a minute. Configurable as
+# `ssh_timeout`; every remote call in relay uses that one value, never a
+# literal of its own, so nothing can be accidentally tighter than the rest.
+DEFAULT_SSH_TIMEOUT = 30.0
+
+# How relay runs its *own* commands on the login node. `-T` (no pty: these are
+# probes, not sessions) plus a bare bash that reads no startup files. This
+# skips whatever the user's rc files would do for the inner shell; it cannot
+# skip the login shell sshd itself spawns to run this command, which on some
+# bash builds (SSH_SOURCE_BASHRC) still sources ~/.bashrc. That outer cost is
+# what the doctor's slow-round-trip warning points at. Never applied to the
+# training job: that runs under Slurm, in the user's own environment.
+REMOTE_SHELL = ("bash", "--noprofile", "--norc", "-c")
+
+
+def remote_shell_argv(command: str) -> list[str]:
+    """Wrap one already-quoted shell command line in relay's clean shell.
+
+    `command` is a string a POSIX shell would execute (the caller has done any
+    quoting of paths and arguments). The result is the remote argv:
+    `bash --noprofile --norc -c '<command>'`, ready for `build_ssh_argv`.
+    """
+    return [*REMOTE_SHELL, command]
+
 
 def relay_dir() -> Path:
     """`~/.relay/`, the directory the control socket lives in. Not created."""
@@ -129,6 +161,10 @@ def build_ssh_argv(alias: str, remote_argv: list[str]) -> list[str]:
     _check_alias(alias)
     return [
         "ssh",
+        # No pseudo-terminal: these are commands whose output relay parses,
+        # not interactive sessions. A pty would turn "\n" into "\r\n" and
+        # let the remote shell think somebody is watching.
+        "-T",
         *_common_options(),
         "-o", "BatchMode=yes",
         alias,
@@ -159,15 +195,18 @@ def master_check_argv(alias: str) -> list[str]:
     return ["ssh", "-o", f"ControlPath={CONTROL_PATH_TEMPLATE}", "-O", "check", alias]
 
 
-def master_alive(alias: str, runner=None) -> bool:
+def master_alive(alias: str, runner=None, timeout: float = DEFAULT_SSH_TIMEOUT) -> bool:
     """Run `ssh -O check` and report whether a master is up.
 
     `runner` is the same `(argv, input_bytes, timeout) -> (rc, out, err)`
-    seam the backends use, so tests never touch a real socket.
+    seam the backends use, so tests never touch a real socket. The check
+    talks only to the local socket and normally answers in milliseconds; the
+    timeout is the shared `ssh_timeout` anyway, so nothing in relay waits
+    less than anything else.
     """
     run = runner or _default_runner
     try:
-        rc, _out, _err = run(master_check_argv(alias), None, 10.0)
+        rc, _out, _err = run(master_check_argv(alias), None, timeout)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return rc == 0
@@ -215,10 +254,17 @@ def _check_alias(alias: str) -> None:
 
 
 def _default_runner(argv: list[str], input_bytes: bytes | None, timeout: float):
-    """subprocess.run in the shape the backends' `runner` seam expects."""
+    """subprocess.run in the shape the backends' `runner` seam expects.
+
+    With no input to send, stdin is /dev/null rather than inherited. ssh
+    otherwise forwards relay's own stdin to the remote command, and a
+    command that reads it (or a shell startup file that does) would block
+    until the timeout for no reason anyone could see.
+    """
     proc = subprocess.run(
         argv,
         input=input_bytes,
+        stdin=None if input_bytes is not None else subprocess.DEVNULL,
         capture_output=True,
         timeout=timeout,
         check=False,

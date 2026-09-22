@@ -41,6 +41,27 @@ from pathlib import Path
 
 import yaml
 
+from relay import ssh
+
+# --------------------------------------------------------------------------
+# SSH timing
+# --------------------------------------------------------------------------
+
+# How long one remote round trip may take before relay gives up on it, in
+# seconds. The number and the measurement that justifies it live together in
+# ssh.py; this reads it from there rather than repeating the literal, so the
+# value relay hands out and the comment explaining it cannot drift apart.
+# ssh.py keeps it as a float because that is what `subprocess.run(timeout=)`
+# wants; the config key is whole seconds, so it is narrowed once, here.
+DEFAULT_SSH_TIMEOUT = int(ssh.DEFAULT_SSH_TIMEOUT)
+
+# The lowest ssh_timeout that can possibly work. One round trip through an
+# already-open ControlMaster on Klone measured 4 to 5 seconds -- none of it
+# network time, all of it the login node starting a shell -- and a loaded
+# login node is slower still. Below 5, relay would abandon commands that were
+# about to succeed and report a healthy cluster as unreachable.
+MIN_SSH_TIMEOUT = 5
+
 # --------------------------------------------------------------------------
 # Errors
 # --------------------------------------------------------------------------
@@ -248,6 +269,17 @@ class Config:
     # into a module or conda environment rather than a bare name.
     remote_python: str = "python3"
 
+    # Seconds relay allows for one remote round trip. Every remote call in
+    # relay uses this one value - the Slurm backend, the daemon's polling loop,
+    # each of doctor's checks - so that nothing ends up accidentally tighter
+    # than the rest and no module carries a timeout literal of its own.
+    #
+    # It is not a network number. Through a live ControlMaster the connection
+    # is already open and there is no handshake left to do; what takes the time
+    # is the login node starting a shell to run the command. See
+    # relay.ssh.DEFAULT_SSH_TIMEOUT for the Klone measurement behind the 30.
+    ssh_timeout: int = DEFAULT_SSH_TIMEOUT
+
     # Where LocalBackend puts run directories. Stored expanded, so no consumer
     # has to remember to call expanduser().
     local_root: str = ""
@@ -330,6 +362,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "ssh_alias",
         "remote_root",
         "remote_python",
+        "ssh_timeout",
         "local_root",
         "requeue_on_term",
         "preempt_grace",
@@ -744,6 +777,34 @@ def load(path: Path | None = None) -> Config:
     ssh_alias = _validate_ssh_alias(_optional_str(raw, "ssh_alias", "top-level"))
     remote_root = _optional_str(raw, "remote_root", "top-level")
     remote_python = _optional_str(raw, "remote_python", "top-level") or "python3"
+
+    ssh_timeout = raw.get("ssh_timeout", DEFAULT_SSH_TIMEOUT)
+    if ssh_timeout is None:
+        ssh_timeout = DEFAULT_SSH_TIMEOUT
+    # bool before int, the same trap as preempt_grace: isinstance(True, int) is
+    # True, so `ssh_timeout: yes` would otherwise become a one-second budget. A
+    # float is rejected rather than rounded, because someone writing 0.5 here
+    # thinks this is a network latency, and the error is the place to say that
+    # it is not.
+    if isinstance(ssh_timeout, bool) or not isinstance(ssh_timeout, int):
+        raise ConfigError(
+            f"ssh_timeout must be a whole number of seconds, but it is "
+            f"{ssh_timeout!r} in {path}. It is how long relay waits for one "
+            f"remote command to come back, and every remote call relay makes "
+            f"uses it. The default is {DEFAULT_SSH_TIMEOUT}."
+        )
+    if ssh_timeout < MIN_SSH_TIMEOUT:
+        raise ConfigError(
+            f"ssh_timeout is {ssh_timeout} in {path}, which is below the "
+            f"{MIN_SSH_TIMEOUT} second floor. This is not a network timeout: "
+            f"even with relay's ControlMaster already open, one round trip "
+            f"costs whatever the login node takes to start a shell, and on "
+            f"Klone that measured 4 to 5 seconds on a quiet day. Below "
+            f"{MIN_SSH_TIMEOUT} relay would give up on commands that were "
+            f"about to succeed and report a healthy cluster as unreachable. "
+            f"Use at least {MIN_SSH_TIMEOUT}, or {DEFAULT_SSH_TIMEOUT}."
+        )
+
     local_root_raw = _optional_str(raw, "local_root", "top-level")
 
     requeue_on_term = _optional_str(raw, "requeue_on_term", "top-level") or "auto"
@@ -829,6 +890,7 @@ def load(path: Path | None = None) -> Config:
         ssh_alias=ssh_alias,
         remote_root=remote_root,
         remote_python=remote_python,
+        ssh_timeout=ssh_timeout,
         local_root=local_root,
         requeue_on_term=requeue_on_term,
         preempt_grace=preempt_grace,
@@ -983,6 +1045,18 @@ backend: local
 # The Python that runs relay's sidecar on the cluster. Often a full path into
 # a module or conda environment rather than a bare name.
 # remote_python: python3
+
+# Seconds relay allows for one remote command to come back. Every remote call
+# uses this one number: submitting a job, the daemon's polling, each of
+# `relay doctor`'s checks.
+#
+# This is not a network number. Through relay's ControlMaster the connection
+# is already open, so what you are waiting for is the login node starting a
+# shell to run the command - on Klone that measured 4 to 5 seconds with the
+# master up, thanks to a conda init in ~/.bashrc, and a busy login node is
+# worse. Raise this if `relay doctor`'s ssh check warns that your login node
+# is slow and you cannot trim your ~/.bashrc. The minimum is 5.
+# ssh_timeout: 30
 
 # slurm:
 #   # Slurm account to charge the job to.

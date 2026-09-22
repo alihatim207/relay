@@ -36,11 +36,22 @@ raises. A refused connection, a timeout, a missing `ssh` binary -- all of them
 come back as an `SshResult` with `ok=False` and a message. The check that asked
 turns that into an `"error"` result and the *next* check still gets to run.
 
-**Checks are timed.** `duration_ms` is on every result, and for the SSH
-round-trip check the duration is the whole point: on Hyak a cold connection
-means a Duo push and tens of seconds, while a connection riding an existing
-ControlMaster socket comes back in milliseconds. A slow round trip is the
-symptom that tells you multiplexing is not working.
+**Checks are timed, but latency never names its own cause.** `duration_ms` is
+on every result, and for the SSH round-trip check the number is worth printing
+-- it is not worth drawing a conclusion from on its own. The first real Klone
+run measured 4.8 seconds through a *live* ControlMaster, because the login node
+runs `conda init` out of ~/.bashrc before it will run anything at all. doctor
+read that number by itself and announced that ssh had "opened a fresh
+connection instead of reusing relay's ControlMaster socket", which was flatly
+untrue, and then its own 15 second timeout failed the check outright and
+skipped all ten remote checks behind it.
+
+So the ssh check reads `ctx.master_alive` -- the answer the master check, which
+runs first, already has -- and only mentions a fresh connection when there is
+genuinely no master to reuse. Latency is a symptom; the master check is the
+cause. And the timeout it runs under is generous enough that a slow login node
+produces a *warning* you can read rather than an error that hides everything
+else.
 """
 
 from __future__ import annotations
@@ -77,18 +88,22 @@ from relay.store import Store
 # Tunables
 # --------------------------------------------------------------------------
 
-# How long any single remote command may take before we give up on it. Long
-# enough to survive a busy login node, short enough that `relay doctor` still
-# finishes while you are looking at it. Note this is *not* long enough to
-# complete a Duo push, which is deliberate: see SSH_SLOW_SECONDS below.
-SSH_TIMEOUT_SECONDS = 15.0
-
-# Above this, a successful round trip is reported as a warning. A multiplexed
-# connection over an existing ControlMaster socket answers in tens of
-# milliseconds; anything measured in seconds means ssh is negotiating a fresh
-# session, which on a two-factor cluster is both slow and (once the push times
-# out) unreliable.
-SSH_SLOW_SECONDS = 2.0
+# doctor has no timeout constant of its own, on purpose.
+#
+# There used to be two: a 15 second cap on every remote command and a 2 second
+# "this is slow" threshold. Both were wrong on a real login node. Klone answers
+# a trivial command in 4 to 5 seconds *through a live master* -- the time goes
+# on starting a shell, not on the network -- so 2 seconds warned about
+# something that was working and 15 seconds failed a check that would have
+# succeeded.
+#
+# The number now comes from `conf.ssh_timeout` (see `_ssh_timeout` below),
+# which defaults to `ssh.DEFAULT_SSH_TIMEOUT`. One value for the whole of
+# relay: the daemon, the backend and doctor all wait the same length of time,
+# so no check here can be accidentally tighter than the thing it is checking
+# on behalf of. That one value is also the threshold above which a *successful*
+# round trip is reported as a warning -- "slower than relay is willing to wait"
+# is the honest definition of too slow, and it needs no second constant.
 
 # Free space on remote_root below which we warn. Checkpoints are large and a
 # job that dies at 3am because the filesystem filled up is a bad way to find out.
@@ -184,22 +199,38 @@ class SshResult:
         return f"exit code {self.returncode}"
 
 
-def _ssh(alias: str, args: list[str], timeout: float = SSH_TIMEOUT_SECONDS) -> SshResult:
+def _ssh(
+    alias: str, args: list[str], timeout: float = ssh_mod.DEFAULT_SSH_TIMEOUT
+) -> SshResult:
     """Run one remote command over relay's ssh options, and never raise.
 
     `alias` is a Host block name from the user's `~/.ssh/config`, handed to the
     ssh binary untouched so that their own configuration supplies the username,
     hostname, key and jump host.
 
-    `args` are the words of the remote command. ssh joins them with spaces and
-    the *remote* shell parses the result, which is why anything containing a
-    path gets `shlex.quote()`d by the caller, and why `$(whoami)` in a command
-    string expands on the cluster rather than here (`subprocess.run` with a list
-    does no local shell expansion at all).
+    `args` are the words of the remote command. They are joined with spaces
+    into one command line -- which is why anything containing a path gets
+    `shlex.quote()`d by the caller, and why `$(whoami)` in a command string
+    expands on the cluster rather than here (`subprocess.run` with a list does
+    no local shell expansion at all).
+
+    That command line is then wrapped by `ssh.remote_shell_argv`, so every
+    probe doctor builds runs under `bash --noprofile --norc -c`. This is the
+    one place that wrapping happens, so no check can forget it. The point is
+    the check the login node failed: a `conda init` in ~/.bashrc costs seconds
+    on every single round trip, and none of these probes -- `true`,
+    `command -v sbatch`, `df` -- needs anything a startup file sets up. It does
+    not touch the training job, which runs under Slurm in the user's own
+    environment.
+
+    The wrapped command is `shlex.quote`d because ssh joins its trailing
+    arguments with spaces and hands the string to the *remote* login shell:
+    without the quoting, that shell would parse the probe's own `;` and `|`
+    before bash ever saw them.
 
     The argv comes from `relay.ssh.build_ssh_argv`, so doctor exercises exactly
     the connection the daemon and the backend use: relay's own ControlMaster,
-    relay's ControlPath, and `BatchMode=yes`. BatchMode is what keeps this
+    relay's ControlPath, `-T`, and `BatchMode=yes`. BatchMode is what keeps this
     check honest -- without it a doctor run against a host with no live master
     sits forever on a Duo prompt nobody will see, and a health check that hangs
     is worse than one that fails.
@@ -208,7 +239,8 @@ def _ssh(alias: str, args: list[str], timeout: float = SSH_TIMEOUT_SECONDS) -> S
     because the caller's job is to report them and let later checks run.
     """
     try:
-        argv = ssh_mod.build_ssh_argv(alias, args)
+        remote_argv = ssh_mod.remote_shell_argv(shlex.quote(" ".join(args)))
+        argv = ssh_mod.build_ssh_argv(alias, remote_argv)
     except ValueError as exc:
         # Raised for an empty alias or anything shaped like `user@host`.
         return SshResult(
@@ -217,14 +249,20 @@ def _ssh(alias: str, args: list[str], timeout: float = SSH_TIMEOUT_SECONDS) -> S
     return _run_ssh(argv, timeout)
 
 
-def _ssh_master_check(alias: str, timeout: float = SSH_TIMEOUT_SECONDS) -> SshResult:
+def _ssh_master_check(
+    alias: str, timeout: float = ssh_mod.DEFAULT_SSH_TIMEOUT
+) -> SshResult:
     """Run `ssh -O check`: "is relay's master alive for this alias?"
 
     A second seam of the same shape as `_ssh`, because the argv is a different
-    shape: `-O check` takes no remote command and speaks only to the local
-    control socket, so it costs nothing and can never trigger Duo. That is why
-    this check still runs when the round-trip check failed -- it is usually the
-    explanation.
+    shape: `-O check` takes no remote command (so there is nothing to wrap in a
+    clean shell) and speaks only to the local control socket, so it costs
+    nothing and can never trigger Duo. That is why this check still runs when
+    the round-trip check failed -- it is usually the explanation.
+
+    The timeout is the shared `ssh_timeout` even though a local socket answers
+    in milliseconds. Nothing in relay waits less than that one value; a second,
+    tighter number here would be one more thing that can be wrong on its own.
     """
     try:
         argv = ssh_mod.master_check_argv(alias)
@@ -252,11 +290,12 @@ def _run_ssh(argv: list[str], timeout: float) -> SshResult:
             stdout="",
             stderr="",
             duration_ms=_ms_since(start),
-            error=(
-                f"ssh did not answer within {timeout:.0f} seconds "
-                f"(if this host needs a two-factor login, run `relay connect` "
-                f"first so relay can reuse its own ControlMaster socket)"
-            ),
+            # Deliberately says only what happened, not why. This helper has no
+            # idea whether a master is alive, and the sentence it used to add
+            # ("run `relay connect`") was pure guesswork that the calling check
+            # then repeated to a user whose master was up the whole time. The
+            # ssh check knows the answer and adds the cause itself.
+            error=f"ssh did not answer within {timeout:.0f} seconds",
         )
     except FileNotFoundError:
         return SshResult(
@@ -323,6 +362,27 @@ def _skipped(name: str, reason: str) -> CheckResult:
     return CheckResult(name=name, status=SKIP, detail=f"Skipped: {reason}.")
 
 
+def _ssh_timeout(conf: cfg.Config) -> float:
+    """The one number every remote call in doctor waits, in seconds.
+
+    `getattr` rather than `conf.ssh_timeout` so that a Config built by older
+    code -- or by a test that constructs one by hand -- still works and simply
+    gets the shared default. A nonsensical value (zero, negative, not a number)
+    falls back too: a health check may not be the thing that crashes.
+    """
+    raw = getattr(conf, "ssh_timeout", ssh_mod.DEFAULT_SSH_TIMEOUT)
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return ssh_mod.DEFAULT_SSH_TIMEOUT
+    return seconds if seconds > 0 else ssh_mod.DEFAULT_SSH_TIMEOUT
+
+
+def _human_duration(ms: float) -> str:
+    """"30 ms" or "4.8s" -- seconds once milliseconds stop being readable."""
+    return f"{ms:.0f} ms" if ms < 1000 else f"{ms / 1000.0:.1f}s"
+
+
 @dataclass
 class _Context:
     """The few facts one check learns that a later check needs.
@@ -343,7 +403,10 @@ class _Context:
 
     # Did `ssh -O check` find a live master? Read by the ssh round-trip check,
     # which otherwise cannot tell "the cluster is down" from "nobody has run
-    # `relay connect` yet".
+    # `relay connect` yet" -- nor, and this is the one that bit us, "the login
+    # node takes five seconds to start a shell" from "ssh re-authenticated".
+    # Every sentence that check writes about *why* it was slow or why it failed
+    # comes from this flag, never from the clock.
     master_alive: bool = False
 
     # Parsed `scontrol show partition <p>`, or None when that check did not get
@@ -609,7 +672,7 @@ def _check_master(conf: cfg.Config, ctx: _Context) -> CheckResult:
     if not alias:
         return _skipped("master", "no ssh_alias is configured")
 
-    result = _ssh_master_check(alias)
+    result = _ssh_master_check(alias, timeout=_ssh_timeout(conf))
 
     if not result.ok:
         return CheckResult(
@@ -645,6 +708,26 @@ def _check_master(conf: cfg.Config, ctx: _Context) -> CheckResult:
 
 
 def _check_ssh(conf: cfg.Config, ctx: _Context) -> CheckResult:
+    """Can relay reach the login node, and how long did it take?
+
+    Which sentence you get depends on *two* facts, never one: whether the round
+    trip worked, and whether `ctx.master_alive` -- filled in by the master
+    check, which runs first -- says relay has a live multiplexed connection.
+    The clock alone cannot tell these cases apart, and pretending it can is what
+    produced a confident, false diagnosis on the first real Klone run.
+
+        fast (either)          -> ok
+        slow, master alive     -> warn: the login node is slow (shell startup)
+        slow, no master        -> warn: ssh negotiated a fresh connection
+        failed, master alive   -> error: it did not answer; raise ssh_timeout
+        failed, no master      -> error: run `relay connect`
+
+    Only the two "no master" rows may blame the connection, because only there
+    is there actually no connection to reuse. "Slow" means slower than
+    `ssh_timeout`, which is also how long relay is willing to wait anywhere
+    else: below that, a slow login node is a fact about the cluster rather than
+    a problem with relay, and doctor says nothing about it.
+    """
     alias = conf.ssh_alias
     if not alias:
         # config.load() already refuses a slurm backend with no alias, so this
@@ -656,6 +739,18 @@ def _check_ssh(conf: cfg.Config, ctx: _Context) -> CheckResult:
             f"block from your ~/.ssh/config, for example 'klone'.",
         )
 
+    timeout = _ssh_timeout(conf)
+
+    # Twice the timeout, and this is the one call in doctor that gets more than
+    # the shared value. `timeout` is *also* the threshold above which a
+    # successful round trip warns, so if the subprocess were cut off at exactly
+    # that number the warn branch below could never fire: every round trip slow
+    # enough to be worth warning about would come back as a timeout *error*
+    # instead, and the user would be told the host is unreachable when it is
+    # merely slow. The subprocess timeout has to exceed the warn threshold for
+    # the warning to exist at all.
+    round_trip_timeout = 2 * timeout
+
     # `true` is the cheapest possible remote command: it proves the whole path
     # (ssh config, network, authentication, remote shell) without producing
     # output or side effects.
@@ -663,10 +758,11 @@ def _check_ssh(conf: cfg.Config, ctx: _Context) -> CheckResult:
     # This still runs when there is no live master. BatchMode makes it fail
     # fast instead of hanging, and a fast failure with the right sentence
     # attached is more useful than a skipped check.
-    result = _ssh(alias, ["true"])
+    result = _ssh(alias, ["true"], timeout=round_trip_timeout)
 
     # The master check ran first, so we can name the likeliest cause instead of
-    # leaving the user to guess which of two problems they have.
+    # leaving the user to guess which of two problems they have. With a master
+    # alive there is nothing to say here: `relay connect` has already been run.
     hint = (
         ""
         if ctx.master_alive
@@ -675,6 +771,22 @@ def _check_ssh(conf: cfg.Config, ctx: _Context) -> CheckResult:
     )
 
     if not result.ok:
+        # ssh itself could not run, could not connect, or ran out of time.
+        if ctx.master_alive:
+            # Not an authentication problem: relay is holding an authenticated
+            # connection to this host right now. Something on the far end is
+            # not answering, and the only levers the user has are patience (a
+            # bigger ssh_timeout) and a look at the login node itself.
+            return CheckResult(
+                "ssh",
+                ERROR,
+                f"Could not reach {alias}: {result.message()}. relay's SSH master "
+                f"is alive, so this is not an authentication problem -- the login "
+                f"node did not answer within ssh_timeout ({timeout:.0f}s). Raise "
+                f"ssh_timeout in {cfg.config_path()} if the node is merely slow, "
+                f"or check that it is healthy with `ssh {alias} true` by hand.",
+                result.duration_ms,
+            )
         return CheckResult(
             "ssh",
             ERROR,
@@ -702,21 +814,38 @@ def _check_ssh(conf: cfg.Config, ctx: _Context) -> CheckResult:
         )
 
     seconds = result.duration_ms / 1000.0
-    if seconds > SSH_SLOW_SECONDS:
+    if seconds > timeout:
+        if ctx.master_alive:
+            # The case the old code got wrong. Nothing was re-authenticated:
+            # relay's master carried this command, and the time went somewhere
+            # on the far end -- on Klone, into a `conda init` that every shell
+            # runs before it will run anything. Say that, suggest the two real
+            # levers, and make no claim about the connection.
+            return CheckResult(
+                "ssh",
+                WARN,
+                f"Round trip to {alias} took {seconds:.1f}s through relay's live "
+                f"SSH master. The login node is slow to respond; remote shell "
+                f"startup is the usual reason (for example `conda init` in "
+                f"~/.bashrc). Trim it, or raise ssh_timeout in "
+                f"{cfg.config_path()}.",
+                result.duration_ms,
+            )
+        # No master, so ssh really did negotiate a connection of its own, and
+        # here the seconds are a fair thing to point at.
         return CheckResult(
             "ssh",
             WARN,
-            f"Reached {alias}, but the round trip took {seconds:.1f}s. That is "
-            f"slow enough to mean ssh opened a fresh connection instead of reusing "
-            f"relay's ControlMaster socket. On a cluster with two-factor login "
-            f"relay polls far too often to re-authenticate each time: run "
-            f"`relay connect` to start the master.",
+            f"Reached {alias}, but the round trip took {seconds:.1f}s with no live "
+            f"SSH master, so ssh negotiated a fresh connection of its own. On a "
+            f"cluster with two-factor login relay polls far too often to "
+            f"re-authenticate each time: run `relay connect` to start the master.",
             result.duration_ms,
         )
     return CheckResult(
         "ssh",
         OK,
-        f"Reached {alias} in {result.duration_ms:.0f} ms.",
+        f"Reached {alias} in {_human_duration(result.duration_ms)}.",
         result.duration_ms,
     )
 
@@ -733,7 +862,7 @@ def _check_remote_python(conf: cfg.Config, ctx: _Context) -> CheckResult:
     # quote(): remote_python is often a full path into a conda environment and
     # those paths sometimes contain spaces. ssh hands the words to a remote
     # shell, so quoting has to happen here.
-    result = _ssh(alias, [shlex.quote(python), "--version"])
+    result = _ssh(alias, [shlex.quote(python), "--version"], timeout=_ssh_timeout(conf))
 
     if not result.ok:
         return CheckResult(
@@ -774,7 +903,7 @@ def _check_sbatch(conf: cfg.Config, ctx: _Context) -> CheckResult:
 
     # `command -v` is the POSIX builtin for "where would the shell find this";
     # `which` is not standardised and behaves differently between systems.
-    result = _ssh(alias, ["command", "-v", "sbatch"])
+    result = _ssh(alias, ["command", "-v", "sbatch"], timeout=_ssh_timeout(conf))
 
     if not result.ok:
         return CheckResult(
@@ -827,7 +956,11 @@ def _check_account(conf: cfg.Config, ctx: _Context) -> CheckResult:
     # connection may cost a Duo push.
     #
     # -n drops the header, -P prints pipe-separated fields with no padding.
-    result = _ssh(alias, ["sacctmgr -n -P show assoc user=$(whoami) format=account"])
+    result = _ssh(
+        alias,
+        ["sacctmgr -n -P show assoc user=$(whoami) format=account"],
+        timeout=_ssh_timeout(conf),
+    )
 
     if not result.ok or result.returncode != 0:
         # A warning, not an error: sacctmgr is not installed on every cluster,
@@ -878,7 +1011,11 @@ def _check_partition(conf: cfg.Config, ctx: _Context) -> CheckResult:
             f"nodes (a GPU partition, say).",
         )
 
-    result = _ssh(alias, ["scontrol", "show", "partition", shlex.quote(partition)])
+    result = _ssh(
+        alias,
+        ["scontrol", "show", "partition", shlex.quote(partition)],
+        timeout=_ssh_timeout(conf),
+    )
 
     if not result.ok:
         return CheckResult(
@@ -1039,7 +1176,11 @@ def _check_preempt_window(conf: cfg.Config, ctx: _Context) -> CheckResult:
     if grace is not None and grace > 0:
         effective: int | None = grace
     else:
-        result = _ssh(conf.ssh_alias or "", ["scontrol", "show", "config"])
+        result = _ssh(
+            conf.ssh_alias or "",
+            ["scontrol", "show", "config"],
+            timeout=_ssh_timeout(conf),
+        )
         duration_ms = result.duration_ms
         if result.succeeded():
             kill_wait = parse_kill_wait(result.stdout)
@@ -1188,7 +1329,7 @@ def _check_remote_root(conf: cfg.Config, ctx: _Context) -> CheckResult:
     command = _REMOTE_ROOT_PROBE.format(
         root=shlex.quote(root), no_dir=_NO_DIR, no_write=_NO_WRITE, ok=_ROOT_OK
     )
-    result = _ssh(alias, [command])
+    result = _ssh(alias, [command], timeout=_ssh_timeout(conf))
 
     if not result.ok or result.returncode != 0:
         return CheckResult(

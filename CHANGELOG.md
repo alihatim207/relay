@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `relay doctor` blamed a slow round trip on ssh "opening a fresh connection" and, at 15s, failed the check and skipped every remote check. On Klone a round trip through a live master takes 4–5s because the login node is slow to start a shell. The check now branches on whether the master is alive and only points at `~/.bashrc` startup cost when it is; every remote timeout in the backend, daemon, and doctor is the single configurable `ssh_timeout` (default 30); relay's probe commands run with `ssh -T`, closed stdin, and `bash --noprofile --norc -c` (never the training job).
 - `relay connect` failed after Duo with `unix_listener: cannot bind to path ~/.relay/...: No such file or directory`: the ControlPath directory was never created. Every ssh argv builder now ensures `~/.relay` exists with mode 0700 (and corrects a looser mode), so connect, the daemon, doctor, and the backend are all covered. `doctor` gained a `control_dir` check. ssh exit-255 errors now quote ssh's last stderr line instead of always suggesting "check that plain ssh works".
 
 ### Added

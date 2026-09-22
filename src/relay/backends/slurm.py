@@ -83,10 +83,23 @@ SIDECAR_CONFIG_FILENAME = "sidecar.json"
 # user asked me to stop" and "Slurm needs this node back, come again later".
 CANCEL_FILENAME = "CANCEL_REQUESTED"
 
-# Seconds to wait for one ssh invocation. Generous, because the first
-# connection of the day may be negotiating a ControlMaster socket, and stingy
-# enough that a wedged login node does not hang the daemon's whole cycle.
-DEFAULT_TIMEOUT = 60.0
+# How long to wait for one ssh invocation. There is deliberately no number
+# here: the value lives in `relay.ssh.DEFAULT_SSH_TIMEOUT`, the config key
+# `ssh_timeout` overrides it, and this backend carries it as
+# `self.ssh_timeout`. Every remote call in this file uses that one value (or
+# an explicit multiple of it, each one commented), so no code path can end up
+# quietly tighter than the rest -- which is exactly how the first real Klone
+# run failed, with a 10 second literal against a login node that needs 4 to 5
+# seconds just to start a shell.
+SSH_TIMEOUT_DEFAULT = ssh_mod.DEFAULT_SSH_TIMEOUT
+
+# `sbatch` gets twice the budget of an ordinary probe. Submitting is the one
+# remote call that waits on the Slurm *controller* rather than just the login
+# node: on a busy cluster slurmctld can take seconds to answer while it is
+# scheduling, and a submit that times out is worse than a slow one -- relay
+# cannot tell whether the job was accepted, so it can neither record a job ID
+# nor safely retry.
+SBATCH_TIMEOUT_FACTOR = 2
 
 # ssh's own "I could not do my job" exit status. Documented in ssh(1): ssh
 # exits with the remote command's status, except that 255 means ssh itself
@@ -879,7 +892,7 @@ class SlurmBackend(Backend):
         grace_seconds: int = 60,
         sidecar_path: str | Path | None = None,
         runner=None,
-        timeout: float = DEFAULT_TIMEOUT,
+        ssh_timeout: float = SSH_TIMEOUT_DEFAULT,
     ) -> None:
         if "@" in ssh_alias:
             # Defence in depth: config.py already rejects this, but a backend
@@ -896,7 +909,12 @@ class SlurmBackend(Backend):
         self.account = account
         self.partition = partition
         self.grace_seconds = grace_seconds
-        self.timeout = timeout
+
+        # The one timeout this backend knows about. Named `ssh_timeout` rather
+        # than `timeout` because it is the same number the config key, the
+        # daemon and doctor use, and a shared name is what stops the four of
+        # them drifting apart.
+        self.ssh_timeout = ssh_timeout
 
         # Which local sidecar.py gets shipped. Imported lazily from the local
         # backend so there is exactly one answer to "where is the sidecar?".
@@ -927,7 +945,10 @@ class SlurmBackend(Backend):
         `ssh_alias` or `remote_root`, but this constructor can also be reached
         from tests and from `doctor`, so it checks rather than trusting.
 
-        Only the four cluster-shaped settings come through here. The rest of
+        Only the cluster-shaped settings come through here: where the cluster
+        is (`ssh_alias`, `remote_root`, `remote_python`), what to charge
+        (`account`, `partition`), the grace period, and how long relay waits
+        for one round trip (`ssh_timeout`). The rest of
         the `slurm:` block -- the time limit, `gres`, `sbatch_extra`, `setup`
         -- reaches the backend on the JobSpec, because the CLI is the one
         place that merges config with what the user typed. Reading config in
@@ -948,6 +969,12 @@ class SlurmBackend(Backend):
             partition=conf.slurm.partition,
             grace_seconds=conf.slurm.grace_seconds,
             runner=runner,
+            # `getattr` rather than `conf.ssh_timeout`: older configs (and the
+            # handful of tests that build a Config by hand) may not carry the
+            # key at all, and a backend that refuses to exist because nobody
+            # set a timeout would be a silly way to fail. The default is the
+            # same one `config.py` writes, so the two agree either way.
+            ssh_timeout=getattr(conf, "ssh_timeout", SSH_TIMEOUT_DEFAULT),
         )
 
     # -- the one place that runs ssh ---------------------------------------
@@ -967,34 +994,98 @@ class SlurmBackend(Backend):
 
         `remote_argv` is the command as a list of words. ssh has no way to pass
         an argv vector: it joins everything after the alias with spaces and
-        hands the resulting *string* to the remote login shell. So every word is
+        hands the resulting *string* to a remote shell. So every word is
         `shlex.quote`d here, once, in the one place that can guarantee it. That
         is what keeps a path with a space, or the `|` in `--format=%i|%T` (which
         an unquoted remote shell would read as a pipe), from being reinterpreted
         on the far side.
 
-        The argv itself is built by `relay.ssh.build_ssh_argv`, which is the
-        single place that knows relay's ControlMaster options (including
-        `BatchMode=yes`, without which a daemon whose credentials have expired
-        blocks forever on a Duo prompt nobody is watching -- and a hang is much
-        worse than an error). `relay connect` and `doctor` build their argvs
-        from the same module, so relay's three ways of touching ssh cannot
-        drift apart and end up using two different control sockets.
+        A shell *snippet* (one with `;`, `&&` or a redirect in it) is not a
+        word list and must not be quoted word by word -- `_ssh_script` takes
+        those.
+
+        `timeout` defaults to `self.ssh_timeout`. Callers pass a number only
+        to ask for *more* than that, and only as a multiple of it.
         """
+        # One join, one quote per word, and the result is a command line a
+        # shell will re-split into exactly the words that went in.
+        command = " ".join(shlex.quote(word) for word in remote_argv)
+        return self._ssh_command(command, input_bytes, timeout)
+
+    def _ssh_script(
+        self,
+        script: str,
+        input_bytes: bytes | None = None,
+        timeout: float | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        """Run one remote *shell snippet* -- `;`, `&&`, redirects and all.
+
+        `script` is handed to relay's remote shell verbatim, as its `-c`
+        argument, so the snippet's own operators keep their meaning. Anything
+        inside it that came from outside relay (a path, a job ID) must already
+        be `shlex.quote`d by the caller, because this function cannot tell a
+        deliberate `;` from one that arrived in a filename.
+
+        There is exactly one shell on the far side, not two. An earlier
+        version wrapped snippets in `sh -c` here and then `_ssh` quoted that
+        into relay's `bash -c`, which meant every read of an event log forked
+        two shells to run one `tail`.
+        """
+        return self._ssh_command(script, input_bytes, timeout)
+
+    def _ssh_command(
+        self,
+        command: str,
+        input_bytes: bytes | None,
+        timeout: float | None,
+    ) -> tuple[int, bytes, bytes]:
+        """The single place a remote command line becomes a real ssh argv.
+
+        `command` is a line a POSIX shell would execute. It is wrapped in
+        relay's own clean shell -- `bash --noprofile --norc -c '<command>'`,
+        from `relay.ssh.remote_shell_argv` -- and *that* argv is quoted word
+        by word for ssh's own space-joining.
+
+        Why the clean shell: every command in this file is relay's own probe,
+        and none of them need the user's environment. Skipping their startup
+        files skips whatever `conda init` and friends put in `~/.bashrc`,
+        which on Klone is most of the 4 to 5 seconds a round trip costs.
+
+        The honest caveat, copied from `relay.ssh`: this cleans the *inner*
+        shell only. sshd still spawns a login shell to run the command relay
+        sends, and on a bash built with SSH_SOURCE_BASHRC that outer shell
+        sources `~/.bashrc` before it ever reaches our `bash --norc`. relay
+        cannot do anything about that from this side; doctor's slow
+        round-trip warning is what points at it.
+
+        The training job gets none of this. It runs under Slurm from the
+        rendered sbatch script, in the user's own environment, because it
+        needs their modules and their conda env -- see `render_sbatch`.
+
+        `build_ssh_argv` is the single place that knows relay's ControlMaster
+        options (including `BatchMode=yes`, without which a daemon whose
+        credentials have expired blocks forever on a Duo prompt nobody is
+        watching -- and a hang is much worse than an error). `relay connect`
+        and `doctor` build their argvs from the same module, so relay's three
+        ways of touching ssh cannot drift apart and end up using two different
+        control sockets.
+        """
+        remote = ssh_mod.remote_shell_argv(command)
         argv = ssh_mod.build_ssh_argv(
             # The alias goes through bare and unquoted. Never "user@host": see
             # the module docstring.
             self.ssh_alias,
-            [shlex.quote(word) for word in remote_argv],
+            [shlex.quote(word) for word in remote],
         )
+        # One number for every remote call in this file. `None` is the normal
+        # case; a caller that passes something passes a multiple of it.
+        wait = self.ssh_timeout if timeout is None else timeout
         try:
-            returncode, stdout, stderr = self.runner(
-                argv, input_bytes, self.timeout if timeout is None else timeout
-            )
+            returncode, stdout, stderr = self.runner(argv, input_bytes, wait)
         except subprocess.TimeoutExpired as exc:
             raise TransportError(
                 f"ssh to {self.ssh_alias} did not answer within "
-                f"{self.timeout if timeout is None else timeout:.0f} seconds. If this "
+                f"{wait:.0f} seconds. If this "
                 f"cluster needs a two-factor login, run `relay connect` to open the "
                 f"shared connection.",
                 # No returncode: ssh never finished, so there is nothing to
@@ -1039,15 +1130,6 @@ class SlurmBackend(Backend):
                 stderr=err,
             )
         return returncode, stdout, stderr
-
-    def _remote_sh(self, script: str) -> list[str]:
-        """Wrap a shell snippet so the remote side runs it as one command.
-
-        Returns `["sh", "-c", script]`; `_ssh` quotes the script into a single
-        argument, so the remote login shell hands the whole thing to `sh`
-        instead of parsing the `&&`, `>` and `;` inside it itself.
-        """
-        return ["sh", "-c", script]
 
     # -- partitions --------------------------------------------------------
 
@@ -1221,8 +1303,13 @@ class SlurmBackend(Backend):
             members[CKPT_HELPER_FILENAME] = ckpt_helper.read_bytes()
         tarball = _build_tarball(members)
         quoted_dir = shlex.quote(run_dir)
-        returncode, _stdout, stderr = self._ssh(
-            self._remote_sh(f"mkdir -p {quoted_dir} && tar -x -C {quoted_dir}"),
+        # One shell snippet, so the `&&` is the remote shell's and not ssh's.
+        # The default `ssh_timeout` is the whole budget here: these are three
+        # small text files, and bytes were never the expensive thing -- if this
+        # call is slow it is the login node or the filesystem, and waiting
+        # longer would not help.
+        returncode, _stdout, stderr = self._ssh_script(
+            f"mkdir -p {quoted_dir} && tar -x -C {quoted_dir}",
             input_bytes=tarball,
         )
         if returncode != 0:
@@ -1234,7 +1321,14 @@ class SlurmBackend(Backend):
             )
 
         # Trip 2: hand it to Slurm.
-        returncode, stdout, stderr = self._ssh(["sbatch", script_path])
+        # Twice the usual budget: this is the one call that waits on
+        # slurmctld rather than on the login node, and a submit that times out
+        # leaves relay unable to say whether the job was accepted. See
+        # SBATCH_TIMEOUT_FACTOR.
+        returncode, stdout, stderr = self._ssh(
+            ["sbatch", script_path],
+            timeout=SBATCH_TIMEOUT_FACTOR * self.ssh_timeout,
+        )
         out = _decode(stdout)
         err = _decode(stderr)
         if returncode != 0:
@@ -1376,7 +1470,8 @@ class SlurmBackend(Backend):
         lands -- and it is preserved here without paying for a second round
         trip, by sequencing both commands inside one remote shell:
 
-            sh -c 'touch <run_dir>/CANCEL_REQUESTED; scancel <id>'
+            bash --noprofile --norc -c \\
+                'touch <run_dir>/CANCEL_REQUESTED; scancel <id>'
 
         `;` rather than `&&`: if the touch fails (an unwritable directory, a
         filesystem hiccup) the cancel must still go out. A job that keeps
@@ -1391,13 +1486,11 @@ class SlurmBackend(Backend):
         """
         if run_dir:
             marker = f"{run_dir.rstrip('/')}/{CANCEL_FILENAME}"
-            command = self._remote_sh(
+            returncode, _stdout, stderr = self._ssh_script(
                 f"touch {shlex.quote(marker)}; scancel {shlex.quote(str(job_id))}"
             )
         else:
-            command = ["scancel", str(job_id)]
-
-        returncode, _stdout, stderr = self._ssh(command)
+            returncode, _stdout, stderr = self._ssh(["scancel", str(job_id)])
         if returncode == 0:
             return
 
@@ -1506,7 +1599,7 @@ class SlurmBackend(Backend):
             f"if [ -f {quoted} ]; then tail -c +{start + 1} {quoted}; "
             f"else exit {ENOENT_RETURNCODE}; fi"
         )
-        returncode, stdout, stderr = self._ssh(self._remote_sh(script))
+        returncode, stdout, stderr = self._ssh_script(script)
 
         if returncode == ENOENT_RETURNCODE:
             raise FileNotFoundError(f"{path} does not exist on {self.ssh_alias}")

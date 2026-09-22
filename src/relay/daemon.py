@@ -328,6 +328,23 @@ def release_lock(handle: IO[str]) -> None:
 # --------------------------------------------------------------------------
 
 
+def _ssh_timeout(backend) -> float:
+    """How long any remote call for this backend may take, in seconds.
+
+    relay has exactly one remote timeout, `ssh_timeout` in the config, and the
+    backend that owns the connection carries it. The daemon makes its own ssh
+    calls in only one place -- `ssh -O check`, to see whether the control
+    master is up -- so it has to read that value off the backend rather than
+    invent a literal, or the socket check could end up tighter or looser than
+    every other call relay makes.
+
+    `getattr` with a default rather than a plain attribute access, because not
+    every backend goes over ssh: `LocalBackend` and the tests' fakes have no
+    `ssh_timeout` at all, and neither has anything to time out.
+    """
+    return getattr(backend, "ssh_timeout", ssh.DEFAULT_SSH_TIMEOUT)
+
+
 class Daemon:
     """Tails every active run's event log into the store.
 
@@ -508,7 +525,11 @@ class Daemon:
             return False
         self._last_auth_check = now
 
-        if not ssh.master_alive(alias, runner=getattr(self.backend, "runner", None)):
+        if not ssh.master_alive(
+            alias,
+            runner=getattr(self.backend, "runner", None),
+            timeout=_ssh_timeout(self.backend),
+        ):
             stats.auth_required = True
             log.debug("no ssh master for %s yet; waiting for `relay connect`", alias)
             return False
@@ -556,7 +577,11 @@ class Daemon:
             kind = ssh.classify_failure(
                 returncode if isinstance(returncode, int) else 0,
                 stderr,
-                ssh.master_alive(alias, runner=getattr(self.backend, "runner", None)),
+                ssh.master_alive(
+                    alias,
+                    runner=getattr(self.backend, "runner", None),
+                    timeout=_ssh_timeout(self.backend),
+                ),
             )
             if kind == ssh.AUTH_REQUIRED:
                 # We have just run the check, so the next cycle's gate should
