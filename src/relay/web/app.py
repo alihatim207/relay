@@ -179,7 +179,7 @@ def create_app(
         # event logs on the shared filesystem every couple of seconds (that is
         # `last_synced`, and it is what the metrics on screen are as fresh as),
         # but it asks the scheduler what state the jobs are in far less often --
-        # no more than every thirty seconds, backing off to five minutes while
+        # no more than every minute, backing off to five minutes while
         # nothing changes, because `squeue` costs an SSH round trip on a shared
         # login node. Metrics two seconds old next to job state forty seconds
         # old is the normal healthy state; collapsing both into one "last

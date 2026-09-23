@@ -275,7 +275,7 @@ def _sync_line(data: dict) -> str:
         filesystem. That is cheap, it bothers nobody else on the cluster, and
         it runs every two seconds while a job is producing output.
       * **job state** comes from `squeue`, which asks slurmctld — one process
-        serving every user on the cluster. Relay holds that to thirty seconds
+        serving every user on the cluster. Relay holds that to a minute
         at the very least and lets it back off towards five minutes while no
         job changes state.
 
@@ -1794,7 +1794,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help=(
-            "the shortest gap between `squeue` calls (default 30). That "
+            "the shortest gap between `squeue` calls (default 60). That "
             "question goes to slurmctld, which every user on the cluster "
             "shares, so relay will not go below its own 10 second floor "
             "whatever you put here. Overrides `daemon.scheduler_interval_min` "

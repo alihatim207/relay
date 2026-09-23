@@ -415,7 +415,7 @@ function renderSync(metricsAge, schedulerAge) {
   //
   // Two numbers, not one, because the daemon fills this page from two
   // independent loops: it tails the event logs every couple of seconds, but
-  // it only asks the scheduler for job state every thirty seconds or so,
+  // it only asks the scheduler for job state every minute or so,
   // backing off further while nothing changes. "metrics 2s ago · job state
   // 40s ago" is what healthy looks like. A single number would have to be one
   // of the two, and either choice lies about the other half of the page.

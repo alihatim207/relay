@@ -1154,7 +1154,7 @@ def test_daemon_section_defaults_when_absent():
     assert conf.daemon.tail_interval_active == 2.0
     assert conf.daemon.tail_interval_queued == 30.0
     assert conf.daemon.tail_interval_idle == 60.0
-    assert conf.daemon.scheduler_interval_min == 30.0
+    assert conf.daemon.scheduler_interval_min == 60.0
     assert conf.daemon.scheduler_interval_max == 300.0
     assert conf.daemon.usage_interval == 300.0
     # Floats, not ints: everything downstream does arithmetic on a monotonic
@@ -1217,7 +1217,7 @@ def test_daemon_partial_section_keeps_the_other_defaults():
     assert daemon.tail_interval_active == 2.0
     assert daemon.tail_interval_queued == 30.0
     assert daemon.tail_interval_idle == 60.0
-    assert daemon.scheduler_interval_min == 30.0
+    assert daemon.scheduler_interval_min == 60.0
     assert daemon.scheduler_interval_max == 300.0
 
 

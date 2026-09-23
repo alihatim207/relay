@@ -90,7 +90,7 @@ META_SCHEMA_VERSION = "schema_version"  # bumped only if the schema changes shap
 # things: a tail is a read on shared storage, while a squeue is a question put
 # to slurmctld, which every user on the cluster shares. So there are two
 # freshness timestamps, not one, and `relay ls` shows both -- metrics two
-# seconds old alongside job state thirty seconds old is the normal, healthy
+# seconds old alongside job state a minute old is the normal, healthy
 # state of affairs, and a single "last synced" number would hide it.
 META_LAST_SCHEDULER_TS = "last_scheduler_ts"  # last successful scheduler poll
 
@@ -1355,7 +1355,7 @@ class Store:
         """Record a successful scheduler poll; returns the timestamp.
 
         Separate from `mark_synced` because the two run on separate schedules:
-        the tail every couple of seconds, the scheduler poll at thirty seconds
+        the tail every couple of seconds, the scheduler poll at sixty seconds
         and backing off from there. A user looking at `relay ls` needs to know
         which of the two numbers on screen is the old one.
         """

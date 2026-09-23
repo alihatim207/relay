@@ -106,19 +106,19 @@ INTERVAL_IDLE = 60.0  # nothing to watch at all
 # day into shared infrastructure to learn something that changes perhaps five
 # times in a run's life.
 #
-# So: a floor of thirty seconds that no amount of activity can talk the daemon
+# So: a floor of sixty seconds that no amount of activity can talk the daemon
 # out of, and a backoff towards SCHEDULER_INTERVAL_MAX while nothing changes.
 # What this costs is latency on a slow-moving fact. A job that starts at
-# 14:03:00 is noticed at 14:03:28 instead. Metrics are unaffected, because
+# 14:03:00 is noticed at 14:03:58 instead. Metrics are unaffected, because
 # they come from the tail.
-SCHEDULER_INTERVAL_MIN = 30.0
+SCHEDULER_INTERVAL_MIN = 60.0
 SCHEDULER_INTERVAL_MAX = 300.0
 
 # What the scheduler interval is multiplied by after a poll in which no run
-# changed state. 1.5 rather than 2 so the climb from 30s to the 300s ceiling
-# takes eight polls (about six minutes) instead of four: gentle enough to save
-# most of the requests, slow enough that a user watching a queue does not
-# suddenly find themselves on a five-minute refresh.
+# changed state. 1.5 rather than 2 so the climb from 60s to the 300s ceiling
+# takes four polls (60, 90, 135, 202, 300 -- about eight minutes) instead of
+# two: gentle enough to save most of the requests, slow enough that a user
+# watching a queue does not suddenly find themselves on a five-minute refresh.
 SCHEDULER_BACKOFF_FACTOR = 1.5
 
 # Exponential backoff after whole-cycle failures: 4s, 8s, 16s ... capped.

@@ -274,10 +274,10 @@ class DaemonConfig:
       for.
 
     So the tail keeps the old adaptive 2/30/60 second schedule and the
-    scheduler poll gets a floor of thirty seconds that no run state can talk it
+    scheduler poll gets a floor of sixty seconds that no run state can talk it
     out of, plus a backoff that stretches towards `scheduler_interval_max`
     while nothing is changing. Job state is *slow-moving* data: a queued job
-    that starts at 14:03 is no less started for being noticed at 14:03:28.
+    that starts at 14:03 is no less started for being noticed at 14:03:58.
 
     `usage_interval` is the `sacct` accounting fetch, which is the most
     expensive question relay asks and the least urgent -- nobody watches
@@ -287,7 +287,7 @@ class DaemonConfig:
     tail_interval_active: float = 2.0
     tail_interval_queued: float = 30.0
     tail_interval_idle: float = 60.0
-    scheduler_interval_min: float = 30.0
+    scheduler_interval_min: float = 60.0
     scheduler_interval_max: float = 300.0
     usage_interval: float = 300.0
 
@@ -814,7 +814,7 @@ def _validate_daemon_section(raw: object) -> DaemonConfig:
     The defaults in `DaemonConfig` are the values relay ships with, and most
     users should never write this section at all. It exists for two kinds of
     people: someone on a cluster whose admins have asked for gentler polling
-    than thirty seconds, and someone debugging who wants the dashboard to
+    than a minute, and someone debugging who wants the dashboard to
     update faster than the tail's two.
     """
     if raw is None:
@@ -1239,7 +1239,7 @@ backend: local
 # so a job you just submitted is noticed promptly.
 #
 # Job state is slow-moving data. A job that starts at 14:03:00 is no less
-# started for being noticed at 14:03:28, and your metrics are live regardless
+# started for being noticed at 14:03:58, and your metrics are live regardless
 # because they come from the tail.
 #
 # relay will not poll the scheduler more often than every 10 seconds whatever
@@ -1255,7 +1255,7 @@ backend: local
 #   tail_interval_active: 2
 #   tail_interval_queued: 30
 #   tail_interval_idle: 60
-#   scheduler_interval_min: 30
+#   scheduler_interval_min: 60
 #   scheduler_interval_max: 300
 #   usage_interval: 300
 

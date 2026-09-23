@@ -27,7 +27,7 @@ is everything it runs there:
 | Command | How often | What it touches |
 | --- | --- | --- |
 | `tail -c +N <run>/events.jsonl`, one per active run | every 2s while a run is producing output, 30s while everything is queued, 60s when nothing is active | shared filesystem |
-| `squeue --me`, one call covering every run | no more often than every 30s, backing off to 5 minutes while nothing changes | slurmctld |
+| `squeue --me`, one call covering every run | no more often than every 60s, backing off to 5 minutes while nothing changes | slurmctld |
 | `sacct -j <ids>`, one call covering every run | every 5 minutes, plus one final reading when a run finishes, then never again for it | Slurm accounting |
 | `mkdir` and `tar -x`, then `sbatch` | two round trips, once per `relay submit` | shared filesystem, then slurmctld |
 | one idle SSH control socket | held open, `ControlPersist=8h` | sshd |
@@ -42,7 +42,7 @@ The two schedules are deliberately separate. Tailing an event log is a
 filesystem read that scales with how much your job has printed, so it can run
 every two seconds without anyone noticing. `squeue` is a question put to
 slurmctld, one process serving every user on the cluster, so relay holds it to
-at least `scheduler_interval_min` (default 30 seconds) no matter how busy your
+at least `scheduler_interval_min` (default 60 seconds) no matter how busy your
 runs are. After each poll in which no job changed state it multiplies the
 interval by 1.5, up to `scheduler_interval_max` (default 300 seconds); any
 state change snaps it straight back to the minimum, and `relay submit` and

@@ -1354,6 +1354,14 @@ def test_a_daemon_cycle_creates_the_ssh_control_directory(
 # nobody runs, and proving a five-minute ceiling by waiting five minutes would
 # give us one nobody can run.
 
+# The numbers these tests reason about -- a 30-second floor, 1.5x backoff to
+# 300 -- pinned explicitly rather than inherited from relay's shipped default,
+# so the tests describe the mechanism and changing the default (as happened
+# when it moved from 30 to 60) does not silently change what they assert. The
+# shipped default has its own test below.
+THIRTY_SECOND_FLOOR = {"scheduler_interval_min": 30.0, "scheduler_interval_max": 300.0}
+
+
 
 class FakeClock:
     """A monotonic clock the test moves by hand.
@@ -1393,13 +1401,13 @@ def test_a_cycle_can_tail_without_polling_the_scheduler(store, backend, tmp_path
     backend.append(path, line(run_id, 1, "run_started"))
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     first = daemon.run_once()
     assert first.tailed
     assert first.scheduler_polled
     assert len(backend.status_calls) == 1
-    assert first.scheduler_interval == pytest.approx(daemon_module.SCHEDULER_INTERVAL_MIN)
+    assert first.scheduler_interval == pytest.approx(THIRTY_SECOND_FLOOR["scheduler_interval_min"])
 
     # Two seconds later: a tail's worth of time, nowhere near a poll's worth.
     backend.append(path, metric_line(run_id, 2, 100, loss=0.5))
@@ -1437,7 +1445,7 @@ def test_the_scheduler_floor_holds_however_many_runs_are_active(store, backend, 
         paths[run_id] = path
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     for cycle in range(10):
         for n, (run_id, path) in enumerate(paths.items()):
@@ -1473,7 +1481,7 @@ def test_the_scheduler_interval_backs_off_to_the_ceiling(store, backend, tmp_pat
     backend.statuses["1001"] = "queued"  # nothing ever changes
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     seen = []
     for _ in range(7):
@@ -1503,7 +1511,7 @@ def test_a_status_change_snaps_the_interval_back_to_the_floor(store, backend, tm
     backend.statuses["1001"] = "queued"
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     for _ in range(3):
         stats = daemon.run_once()
@@ -1538,7 +1546,7 @@ def test_a_poke_polls_at_once_and_resets_the_backoff(store, backend, tmp_path):
     backend.statuses["1001"] = "queued"
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     for _ in range(3):
         stats = daemon.run_once()
@@ -1575,7 +1583,7 @@ def test_a_daemon_started_after_a_poke_does_not_treat_it_as_news(store, backend,
     store.poke_scheduler()
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     # Cycle one polls regardless -- a daemon that has just started should look
     # immediately rather than make the user wait out an interval.
@@ -1600,7 +1608,7 @@ def test_a_failed_poll_neither_grows_nor_resets_the_interval(store, backend, tmp
     backend.statuses["1001"] = "queued"
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     first = daemon.run_once()
     assert first.scheduler_interval == pytest.approx(45.0)
@@ -1636,7 +1644,7 @@ def test_the_sleep_is_the_sooner_of_the_two_schedules(store, backend, tmp_path):
     backend.append(path, line(run_id, 1, "run_started"))
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     stats = daemon.run_once()
     assert stats.running == 1
@@ -1693,7 +1701,7 @@ def test_the_scheduler_freshness_stamp_moves_only_when_the_scheduler_answers(
     backend.append(path, line(run_id, 1, "run_started"))
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     assert store.last_scheduler_synced() is None
 
@@ -1742,7 +1750,7 @@ def test_a_cycle_that_asks_nothing_mid_outage_is_neither_success_nor_failure(
     backend.status_error = ConnectionError("ssh: Operation timed out")
 
     clock = FakeClock()
-    daemon = Daemon(store, backend, clock=clock)  # the real 30s floor
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
     first = daemon.run_once()
     assert first.failed
@@ -1911,6 +1919,21 @@ def test_daemon_intervals_returns_exactly_the_daemon_kwargs(store, backend):
     daemon = Daemon(store, backend, **values)
 
     assert daemon.interval_active == 2.0
-    assert daemon.scheduler_interval_min == 30.0
+    assert daemon.scheduler_interval_min == 60.0
     assert daemon.scheduler_interval_max == 300.0
     assert daemon.usage_interval_seconds == 300.0
+
+
+def test_the_shipped_scheduler_floor_is_one_minute():
+    """The default a user gets without writing a `daemon:` section.
+
+    Sixty rather than thirty: a job that starts at 14:03:00 is no less started
+    for being noticed at 14:03:58, and it halves the steady-state `squeue` rate
+    for every relay user on the cluster. The mechanism tests above pin 30
+    explicitly so they are not making this claim by accident.
+    """
+    from relay import config as config_module
+
+    assert daemon_module.SCHEDULER_INTERVAL_MIN == 60.0
+    assert config_module.DaemonConfig().scheduler_interval_min == 60.0
+    assert Daemon(Store(":memory:"), FakeBackend()).scheduler_interval_min == 60.0
