@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import logging
 import os
 import posixpath
 import secrets
@@ -1491,8 +1492,38 @@ def cmd_daemon(args) -> Output:
         "scheduler_interval_max": args.scheduler_interval_max,
         "usage_interval_seconds": args.usage_interval,
     }
+    _configure_daemon_logging()
     code = daemon_module.main(intervals=overrides)
     return Output(data={"exit_code": code}, renderer=lambda d: [], exit_code=code)
+
+
+def _configure_daemon_logging(stream=None) -> None:
+    """Let the daemon's INFO messages reach the terminal it is running in.
+
+    Every other relay command is quiet unless something is wrong, and that is
+    right for a command that prints a table and exits. The daemon is different:
+    it is a foreground process that runs for hours, and a foreground process
+    that prints nothing for a minute is indistinguishable from one that has
+    hung. What it has to say at INFO is exactly what a person leaving it in a
+    terminal tab wants to see -- that it started and with which intervals,
+    each time a run changes state, when a stale run comes back, when it is
+    told to stop -- and nothing per cycle, so a healthy idle daemon says one
+    line at startup and then only speaks when something happens.
+
+    Configured on the `relay` logger rather than the root logger, so the
+    setting cannot leak into whoever imports this module (a test, the
+    dashboard) and so a handler somebody else installed on the root logger is
+    left alone. Idempotent: a second call adds no second handler, so nothing
+    is ever printed twice.
+    """
+    logger = logging.getLogger("relay")
+    logger.setLevel(logging.INFO)
+    if any(getattr(h, "_relay_daemon", False) for h in logger.handlers):
+        return
+    handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    handler._relay_daemon = True  # type: ignore[attr-defined]
+    logger.addHandler(handler)
 
 
 # --------------------------------------------------------------------------

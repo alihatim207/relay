@@ -14,6 +14,7 @@ developer's real runs.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import textwrap
 from pathlib import Path
@@ -1994,3 +1995,62 @@ def test_passthrough_split_keeps_relay_flags_out_of_the_users_argv():
     )
     assert own == ["submit", "train.py", "--seeds", "0-4"]
     assert passthrough == ["--lr", "3e-4", "--json"]
+
+
+# --------------------------------------------------------------------------
+# relay daemon speaks at INFO
+# --------------------------------------------------------------------------
+
+
+def test_daemon_shows_its_info_messages(monkeypatch):
+    """A foreground process that says nothing for an hour looks hung.
+
+    The daemon logs at INFO the things a person leaving it in a terminal tab
+    wants to see -- that it started, each run's status change, that it is
+    stopping. Python shows only WARNING and above unless somebody configures
+    logging, and nothing in relay did, so `relay daemon` sat there silent and
+    a user reasonably asked whether it was working. Every other command stays
+    quiet: only `cmd_daemon` turns this on.
+    """
+    import io
+
+    stream = io.StringIO()
+    logger = logging.getLogger("relay")
+    # Start from a clean logger, whatever an earlier test left behind, and
+    # put it back afterwards so this test cannot make the rest of the suite
+    # chatty.
+    monkeypatch.setattr(logger, "handlers", [])
+    monkeypatch.setattr(logger, "level", logging.NOTSET)
+
+    def fake_main(**kwargs):
+        logging.getLogger("relay.daemon").info("daemon started (backend=local)")
+        return 0
+
+    monkeypatch.setattr(daemon_module, "main", fake_main)
+    _real_configure = cli._configure_daemon_logging
+    monkeypatch.setattr(cli, "_configure_daemon_logging", lambda: _real_configure(stream))
+
+    assert cli.main(["daemon"]) == 0
+    out = stream.getvalue()
+    assert "daemon started (backend=local)" in out
+    # Timestamped, so a line in a tab left open overnight says *when*.
+    assert out[:2].isdigit() and out[2] == ":"
+
+    # Idempotent: a second configure adds no second handler.
+    _real_configure(stream)
+    _real_configure(stream)
+    assert sum(getattr(h, "_relay_daemon", False) for h in logger.handlers) == 1
+
+
+def test_other_commands_stay_quiet(capsys, monkeypatch):
+    """Turning on INFO is the daemon's business alone.
+
+    `relay ls` prints a table and exits; an INFO line from the store or the
+    config loader above that table would be noise, and a script parsing the
+    output would choke on it.
+    """
+    logger = logging.getLogger("relay")
+    monkeypatch.setattr(logger, "handlers", [])
+    monkeypatch.setattr(logger, "level", logging.NOTSET)
+    cli.main(["ls"])
+    assert not any(getattr(h, "_relay_daemon", False) for h in logger.handlers)
