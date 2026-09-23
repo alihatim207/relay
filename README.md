@@ -19,54 +19,25 @@ shared filesystem, so that is the entire channel:
 No component calls another component's functions. The only shared contracts
 are the event log format and the database schema.
 
-## What relay runs on the login node
-
-Relay reaches the cluster from your laptop over a single SSH connection. This
-is everything it runs there:
-
-| Command | How often | What it touches |
-| --- | --- | --- |
-| `tail -c +N <run>/events.jsonl`, one per active run | every 2s while a run is producing output, 30s while everything is queued, 60s when nothing is active | shared filesystem |
-| `squeue --me`, one call covering every run | no more often than every 60s, backing off to 5 minutes while nothing changes | slurmctld |
-| `sacct -j <ids>`, one call covering every run | every 5 minutes, plus one final reading when a run finishes, then never again for it | Slurm accounting |
-| `mkdir` and `tar -x`, then `sbatch` | two round trips, once per `relay submit` | shared filesystem, then slurmctld |
-| one idle SSH control socket | held open, `ControlPersist=8h` | sshd |
-| `command -v sbatch`, `sacctmgr`, `scontrol show partition`, `df` | only when you run `relay doctor` | shared filesystem and slurmctld |
-
-Every command relay runs there goes through `ssh -T ... bash --noprofile --norc
--c '...'`, so it is one shell per call and your `~/.bashrc` is skipped. None of
-it is CPU-heavy: the sidecar and your training script run on the compute node,
-not here.
-
-The two schedules are deliberately separate. Tailing an event log is a
-filesystem read that scales with how much your job has printed, so it can run
-every two seconds without anyone noticing. `squeue` is a question put to
-slurmctld, one process serving every user on the cluster, so relay holds it to
-at least `scheduler_interval_min` (default 60 seconds) no matter how busy your
-runs are. After each poll in which no job changed state it multiplies the
-interval by 1.5, up to `scheduler_interval_max` (default 300 seconds); any
-state change snaps it straight back to the minimum, and `relay submit` and
-`relay cancel` reset it too, so a job you just submitted or cancelled is
-noticed promptly. There is a hard floor of 10 seconds: configure anything below
-it and relay clamps it up and says so.
-
-Six optional keys in a `daemon:` section of the config tune all of this, all in
-seconds: `tail_interval_active`, `tail_interval_queued`, `tail_interval_idle`,
-`scheduler_interval_min`, `scheduler_interval_max`, `usage_interval`. `relay
-daemon` takes the same six as flags — `--tail-interval-active`,
-`--tail-interval-queued`, `--tail-interval-idle`, `--scheduler-interval-min`,
-`--scheduler-interval-max`, `--usage-interval` — and a flag beats the file.
-
-Because the two schedules run independently, `relay ls`, `relay usage` and the
-dashboard end with two ages rather than one — `metrics 2s ago · job state 41s
-ago` — so job state that is minutes old reads as the design working rather than
-as a daemon that has stopped.
-
 ## Install
 
+Python 3.11 or newer on your laptop. Nothing is installed on the cluster:
+relay copies its two helper files into each run directory at submit time.
+
 ```sh
+git clone https://github.com/alihatim207/relay.git
+cd relay
 pip install -e .
 ```
+
+Or, without a checkout:
+
+```sh
+pip install git+https://github.com/alihatim207/relay.git
+```
+
+Then `relay init` writes a commented config to `~/.config/relay/config.yaml`,
+and `relay doctor` checks it against the cluster.
 
 ## Usage
 
@@ -95,7 +66,7 @@ with `flush=True`. No import required.
 
 On a preemptible partition your job can be evicted at any moment, including in
 its first minute. Slurm sends SIGTERM and then SIGKILL a fixed number of
-seconds later — 10 on UW Klone, and relay cannot extend that window. The
+seconds later (10 on UW Klone), and relay cannot extend that window. The
 sidecar forwards the SIGTERM to your script immediately and gives it
 `preempt_grace - 2` seconds before killing it, but that is a best-effort save,
 not a guarantee. Write your training script accordingly:
@@ -176,4 +147,47 @@ requeue a run you asked it to stop. A run cancelled with raw `scancel` has no
 such file, so if it is configured with `requeue_on_term: always` it can requeue
 itself and come back. Cancel through relay, or use `requeue_on_term: auto`
 (the default), which resolves to `never` on any partition whose `PreemptMode`
-already includes `REQUEUE` — including Klone's.
+already includes `REQUEUE`, including Klone's.
+
+## What relay runs on the login node
+
+Relay reaches the cluster from your laptop over a single SSH connection. This
+is everything it runs there:
+
+| Command | How often | What it touches |
+| --- | --- | --- |
+| `tail -c +N <run>/events.jsonl`, one per active run | every 2s while a run is producing output, 30s while everything is queued, 60s when nothing is active | shared filesystem |
+| `squeue --me`, one call covering every run | no more often than every 60s, backing off to 5 minutes while nothing changes | slurmctld |
+| `sacct -j <ids>`, one call covering every run | every 5 minutes, plus one final reading when a run finishes, then never again for it | Slurm accounting |
+| `mkdir` and `tar -x`, then `sbatch` | two round trips, once per `relay submit` | shared filesystem, then slurmctld |
+| one idle SSH control socket | held open, `ControlPersist=8h` | sshd |
+| `command -v sbatch`, `sacctmgr`, `scontrol show partition`, `df` | only when you run `relay doctor` | shared filesystem and slurmctld |
+
+Every command relay runs there goes through `ssh -T ... bash --noprofile --norc
+-c '...'`, so it is one shell per call and your `~/.bashrc` is skipped. None of
+it is CPU-heavy: the sidecar and your training script run on the compute node,
+not here.
+
+The two schedules are deliberately separate. Tailing an event log is a
+filesystem read that scales with how much your job has printed, so it can run
+every two seconds without anyone noticing. `squeue` is a question put to
+slurmctld, one process serving every user on the cluster, so relay holds it to
+at least `scheduler_interval_min` (default 60 seconds) no matter how busy your
+runs are. After each poll in which no job changed state it multiplies the
+interval by 1.5, up to `scheduler_interval_max` (default 300 seconds); any
+state change snaps it straight back to the minimum, and `relay submit` and
+`relay cancel` reset it too, so a job you just submitted or cancelled is
+noticed promptly. There is a hard floor of 10 seconds: configure anything below
+it and relay clamps it up and says so.
+
+Six optional keys in a `daemon:` section of the config tune all of this, all in
+seconds: `tail_interval_active`, `tail_interval_queued`, `tail_interval_idle`,
+`scheduler_interval_min`, `scheduler_interval_max`, `usage_interval`. `relay
+daemon` takes the same six as flags, `--tail-interval-active`,
+`--tail-interval-queued`, `--tail-interval-idle`, `--scheduler-interval-min`,
+`--scheduler-interval-max`, `--usage-interval`, and a flag beats the file.
+
+Because the two schedules run independently, `relay ls`, `relay usage` and the
+dashboard end with two ages rather than one, `metrics 2s ago · job state 41s
+ago`, so job state that is minutes old reads as the design working rather than
+as a daemon that has stopped.
