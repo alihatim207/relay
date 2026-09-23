@@ -175,12 +175,25 @@ def create_app(
         runs = store.list_runs()
         for run in runs:
             run["latest_metrics"] = store.latest_metrics(run["run_id"])
+        # Two timestamps, because the daemon runs two loops. It tails the
+        # event logs on the shared filesystem every couple of seconds (that is
+        # `last_synced`, and it is what the metrics on screen are as fresh as),
+        # but it asks the scheduler what state the jobs are in far less often --
+        # no more than every thirty seconds, backing off to five minutes while
+        # nothing changes, because `squeue` costs an SSH round trip on a shared
+        # login node. Metrics two seconds old next to job state forty seconds
+        # old is the normal healthy state; collapsing both into one "last
+        # synced" number would hide exactly that, so the page gets both and
+        # says which is which.
         last_synced = store.last_synced()
+        last_scheduler = store.last_scheduler_synced()
         return {
             "runs": runs,
             "daemon_state": store.get_daemon_state(),
             "last_synced": last_synced,
             "last_synced_age_seconds": _age_seconds(last_synced),
+            "last_scheduler": last_scheduler,
+            "last_scheduler_age_seconds": _age_seconds(last_scheduler),
         }
 
     @app.get("/api/runs/{run_id}")
@@ -204,9 +217,15 @@ def create_app(
         run["metric_names"] = store.metric_names(run_id)
         run["latest_metrics"] = store.latest_metrics(run_id)
         run["usage"] = store.list_usage(run_id)
+        # Both freshness numbers, same reasoning as the listing endpoint: the
+        # detail page shows metrics (filesystem) and a status (scheduler) side
+        # by side, and they are never the same age.
         last_synced = store.last_synced()
+        last_scheduler = store.last_scheduler_synced()
         run["last_synced"] = last_synced
         run["last_synced_age_seconds"] = _age_seconds(last_synced)
+        run["last_scheduler"] = last_scheduler
+        run["last_scheduler_age_seconds"] = _age_seconds(last_scheduler)
         return run
 
     @app.get("/api/runs/{run_id}/metrics/{name}")
@@ -296,6 +315,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         last_synced = store.last_synced()
+        last_scheduler = store.last_scheduler_synced()
         body = {
             "by": by,
             "rows": rows,
@@ -303,6 +323,8 @@ def create_app(
             "wasted": wasted,
             "last_synced": last_synced,
             "last_synced_age_seconds": _age_seconds(last_synced),
+            "last_scheduler": last_scheduler,
+            "last_scheduler_age_seconds": _age_seconds(last_scheduler),
         }
 
         # The `cost` key exists only when someone told relay what an hour

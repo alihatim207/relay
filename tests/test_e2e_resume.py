@@ -81,6 +81,14 @@ from relay.backends.local import EXIT_CODE_FILENAME, LocalBackend
 from relay.daemon import EVENTS_FILENAME, Daemon
 from relay.store import Store
 
+# These tests drive `run_once()` by hand, one cycle per beat of the story, and
+# almost every beat turns on what the scheduler said. relay's real scheduler
+# floor is 30 seconds (`daemon.SCHEDULER_INTERVAL_MIN`), which exists to keep
+# an unattended daemon off slurmctld's back -- not to pace a test that never
+# sleeps. So it is switched off here and every cycle polls. The polling cadence
+# itself is what test_daemon.py's scheduling tests are for.
+POLL_EVERY_CYCLE = {"scheduler_interval_min": 0, "scheduler_interval_max": 0}
+
 # Upper bounds on "something has gone wrong", not on how long the test takes.
 # Every loop below normally finishes in well under a second.
 TIMEOUT = 30.0
@@ -200,7 +208,7 @@ class World:
         # config file is loaded anywhere in this file and nothing touches the
         # real home directory.
         self.backend = LocalBackend(root=root / "local")
-        self.daemon = Daemon(self.store, self.backend)
+        self.daemon = Daemon(self.store, self.backend, **POLL_EVERY_CYCLE)
 
         # Spelled the way the daemon spells it: `sources` is keyed on
         # (run_id, path), so a different spelling would silently start a second
@@ -828,6 +836,7 @@ import sys
 import time
 
 import relay_ckpt
+
 
 total = int(sys.argv[1])
 marker = sys.argv[2]

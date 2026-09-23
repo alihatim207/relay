@@ -265,15 +265,39 @@ def _age_seconds(iso_ts: str | None) -> float | None:
 
 
 def _sync_line(data: dict) -> str:
-    """The line CLAUDE.md requires at the bottom of `relay ls`.
+    """The freshness line at the bottom of `relay ls` and `relay usage`.
 
-    Stale data that the user knows is stale is fine. Stale data presented as
-    current is not — so when the daemon has never synced we say so, and point
-    at the reason.
+    Two ages, not one, because the daemon learns the two halves of what is on
+    screen from two different places on two different schedules:
+
+      * **metrics** come from tailing each run's `events.jsonl` on the shared
+        filesystem. That is cheap, it bothers nobody else on the cluster, and
+        it runs every two seconds while a job is producing output.
+      * **job state** comes from `squeue`, which asks slurmctld — one process
+        serving every user on the cluster. Relay holds that to thirty seconds
+        at the very least and lets it back off towards five minutes while no
+        job changes state.
+
+    Collapsing the two into one "last synced" number would mean printing the
+    older of them, and that would make a perfectly healthy daemon look stalled:
+    a job-state figure four minutes old is the design working, not a symptom.
+    Printing both says which half is old, so the user can tell "relay has not
+    looked at the scheduler lately, which is normal" from "relay has stopped".
+
+    Stale data the user knows is stale is fine. Stale data presented as current
+    is not — so when the daemon has never synced at all we say so, and point at
+    the reason.
     """
     if data.get("last_synced") is None:
         return "last synced never — is `relay daemon` running?"
-    return f"last synced {_format_age(data.get('last_synced_age_s'))} ago"
+    metrics = _format_age(data.get("last_synced_age_s"))
+    if data.get("last_scheduler") is None:
+        # The daemon is running and tailing, but has not managed a scheduler
+        # poll yet: a fresh daemon on its first cycle, or one whose `squeue`
+        # calls are all failing. Either way "0s ago" would be a lie.
+        return f"metrics {metrics} ago · job state never polled"
+    scheduler = _format_age(data.get("last_scheduler_age_s"))
+    return f"metrics {metrics} ago · job state {scheduler} ago"
 
 
 def _sync_footer(store: Store) -> dict:
@@ -281,13 +305,23 @@ def _sync_footer(store: Store) -> dict:
 
     One helper, used by `ls` and `usage`, so the two cannot drift into
     disagreeing about how recent relay's data is. It goes into the *data*, not
-    into a rendering: `--json` carries the same three keys the table shows,
-    which is what lets a script notice a stalled daemon too.
+    into a rendering: `--json` carries the same keys the table shows, which is
+    what lets a script notice a stalled daemon too.
+
+    `last_synced` and `last_scheduler` are the two clocks `_sync_line`
+    explains. Both are here rather than one combined number because a script
+    watching for a job to start cares about the scheduler clock, while one
+    watching a loss curve cares about the tail's.
     """
     last_synced = store.last_synced()
+    last_scheduler = store.last_scheduler_synced()
     return {
         "last_synced": last_synced,
         "last_synced_age_s": _age_seconds(last_synced),
+        # The scheduler poll's own clock. Legitimately much older than the one
+        # above -- see `_sync_line` -- and None until the first `squeue` lands.
+        "last_scheduler": last_scheduler,
+        "last_scheduler_age_s": _age_seconds(last_scheduler),
         # The daemon's last transport error, if any. The interesting case is
         # `auth_required`: the fix is a command the user can run, so saying
         # "run `relay connect`" is worth more than a generic ssh failure.
@@ -659,6 +693,17 @@ def cmd_submit(args) -> Output:
                     "command": spec.command,
                 }
             )
+
+        # Once per invocation, not once per seed: the poke is a single "look at
+        # the scheduler now" note, and writing it five times for a five-seed
+        # sweep would say the same thing five times.
+        #
+        # The daemon's scheduler poll stretches towards five minutes while no
+        # job changes state, and a submit is precisely the moment that backoff
+        # is at its most relaxed -- nothing had changed, which is why it backed
+        # off. It is also the moment the user starts watching `relay ls` for
+        # their job to leave the queue. So we tell the daemon to look now.
+        store.poke_scheduler()
 
     def render(data: dict) -> list[str]:
         lines = [f"{r['run_id']}  job {r['job_id']}" for r in data["runs"]]
@@ -1036,6 +1081,12 @@ def _cancel_run(store: Store, run_id: str) -> dict:
     # path.
     backend.cancel(str(job_id), run_dir=run.get("run_dir"))
     store.update_run_status(run_id, "cancelled")
+    # Same reason as `submit`: the daemon's scheduler poll backs off to five
+    # minutes while nothing is changing, and a cancel is exactly when the user
+    # is about to watch for the result. The status written above is relay's
+    # optimistic one; the scheduler owns the real one, and this asks the daemon
+    # to go and get it rather than waiting out the backoff.
+    store.poke_scheduler()
     return {
         "run_id": run_id,
         "job_id": str(job_id),
@@ -1425,7 +1476,22 @@ def cmd_daemon(args) -> Output:
     simple version is `relay daemon` in a tmux pane or a systemd user unit,
     where the supervisor that already exists does the supervising.
     """
-    code = daemon_module.main()
+    # Only the flags the user actually typed; argparse leaves the rest None and
+    # `daemon_intervals` drops those, so "not given" stays distinguishable from
+    # "given the default value" and the config keeps its say. The flag names and
+    # the keyword names differ on purpose: the flags are named for what the user
+    # is tuning (a tail, a scheduler poll) while the keywords are `Daemon`'s own
+    # parameter names, and renaming either to match the other would mean
+    # renaming it in the wrong place.
+    overrides = {
+        "interval_active": args.tail_interval_active,
+        "interval_queued": args.tail_interval_queued,
+        "interval_idle": args.tail_interval_idle,
+        "scheduler_interval_min": args.scheduler_interval_min,
+        "scheduler_interval_max": args.scheduler_interval_max,
+        "usage_interval_seconds": args.usage_interval,
+    }
+    code = daemon_module.main(intervals=overrides)
     return Output(data={"exit_code": code}, renderer=lambda d: [], exit_code=code)
 
 
@@ -1645,7 +1711,88 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- daemon -----------------------------------------------------------
     p_daemon = subparsers.add_parser(
-        "daemon", help="run the syncing loop in the foreground until Ctrl-C"
+        "daemon",
+        help="run the syncing loop in the foreground until Ctrl-C",
+        epilog=(
+            "The interval flags below override the `daemon:` section of the\n"
+            "config for this one run of the daemon. Every one of them defaults\n"
+            "to None, meaning \"not given\", so a flag you leave out keeps\n"
+            "whatever the config says."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Every one of these is `type=float, default=None`. The None is what tells
+    # `daemon_intervals` the flag was absent; a numeric default here would
+    # silently beat the user's config file on every run.
+    p_daemon.add_argument(
+        "--tail-interval-active",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "how often to read new bytes from the event logs while a run is "
+            "producing output (default 2). This is a read on the shared "
+            "filesystem, not a question for the scheduler, so it is cheap. "
+            "Overrides `daemon.tail_interval_active` in the config."
+        ),
+    )
+    p_daemon.add_argument(
+        "--tail-interval-queued",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "how often to read the event logs while every run is still queued "
+            "and there is nothing yet to read (default 30). Overrides "
+            "`daemon.tail_interval_queued` in the config."
+        ),
+    )
+    p_daemon.add_argument(
+        "--tail-interval-idle",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "how often to look when no run is active at all (default 60). "
+            "Overrides `daemon.tail_interval_idle` in the config."
+        ),
+    )
+    p_daemon.add_argument(
+        "--scheduler-interval-min",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "the shortest gap between `squeue` calls (default 30). That "
+            "question goes to slurmctld, which every user on the cluster "
+            "shares, so relay will not go below its own 10 second floor "
+            "whatever you put here. Overrides `daemon.scheduler_interval_min` "
+            "in the config."
+        ),
+    )
+    p_daemon.add_argument(
+        "--scheduler-interval-max",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "the longest gap between `squeue` calls (default 300). The poll "
+            "backs off towards this while no job changes state, and snaps back "
+            "to the minimum when one does. Overrides "
+            "`daemon.scheduler_interval_max` in the config."
+        ),
+    )
+    p_daemon.add_argument(
+        "--usage-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "how often to fetch GPU- and CPU-hours from `sacct` (default 300). "
+            "The most expensive question relay asks and the least urgent; relay "
+            "takes one final reading when a run ends whatever this says. "
+            "Overrides `daemon.usage_interval` in the config."
+        ),
     )
     p_daemon.set_defaults(handler=cmd_daemon)
 

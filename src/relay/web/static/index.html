@@ -409,12 +409,26 @@ function renderBanner(state) {
   }
 }
 
-function renderSync(ageSeconds) {
+function renderSync(metricsAge, schedulerAge) {
   // Always say how old the data is. Stale data the user knows is stale is
   // fine; stale data presented as current is not.
-  $('sync').textContent = (ageSeconds === null || ageSeconds === undefined)
-    ? 'daemon has not synced yet'
-    : 'last synced ' + Math.max(0, Math.round(ageSeconds)) + 's ago';
+  //
+  // Two numbers, not one, because the daemon fills this page from two
+  // independent loops: it tails the event logs every couple of seconds, but
+  // it only asks the scheduler for job state every thirty seconds or so,
+  // backing off further while nothing changes. "metrics 2s ago · job state
+  // 40s ago" is what healthy looks like. A single number would have to be one
+  // of the two, and either choice lies about the other half of the page.
+  const age = (seconds) => Math.max(0, Math.round(seconds)) + 's ago';
+
+  if (metricsAge === null || metricsAge === undefined) {
+    $('sync').textContent = 'daemon has not synced yet';
+    return;
+  }
+  const scheduler = (schedulerAge === null || schedulerAge === undefined)
+    ? 'job state never polled'
+    : 'job state ' + age(schedulerAge);
+  $('sync').textContent = 'metrics ' + age(metricsAge) + ' · ' + scheduler;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +437,7 @@ function renderSync(ageSeconds) {
 
 async function refreshList() {
   const data = await getJSON('/api/runs');
-  renderSync(data.last_synced_age_seconds);
+  renderSync(data.last_synced_age_seconds, data.last_scheduler_age_seconds);
   // Daemon health rides in the runs envelope rather than having an endpoint
   // of its own: this poll already runs every two seconds.
   renderBanner(data.daemon_state);
@@ -626,7 +640,7 @@ async function refreshDetail() {
   const run = await getJSON('/api/runs/' + encodeURIComponent(runId));
   if (currentRun !== runId) return;  // user navigated away mid-request
 
-  renderSync(run.last_synced_age_seconds);
+  renderSync(run.last_synced_age_seconds, run.last_scheduler_age_seconds);
   $('detail-status').textContent = run.status + (run.stale ? ' (stale)' : '');
   $('detail-status').className = 'status status-' + run.status + (run.stale ? ' stale' : '');
   $('detail-meta').textContent =

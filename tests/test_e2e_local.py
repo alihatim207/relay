@@ -80,6 +80,14 @@ from relay.backends.local import EXIT_CODE_FILENAME, LocalBackend
 from relay.daemon import EVENTS_FILENAME, Daemon
 from relay.store import Store
 
+# These tests drive `run_once()` by hand, one cycle per beat of the story, and
+# almost every beat turns on what the scheduler said. relay's real scheduler
+# floor is 30 seconds (`daemon.SCHEDULER_INTERVAL_MIN`), which exists to keep
+# an unattended daemon off slurmctld's back -- not to pace a test that never
+# sleeps. So it is switched off here and every cycle polls. The polling cadence
+# itself is what test_daemon.py's scheduling tests are for.
+POLL_EVERY_CYCLE = {"scheduler_interval_min": 0, "scheduler_interval_max": 0}
+
 # Upper bounds on "something has gone wrong", not on how long the test takes.
 # Every one of these loops normally finishes in well under a second.
 TIMEOUT = 30.0
@@ -130,6 +138,7 @@ import os
 import signal
 import sys
 import time
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--state", required=True)      # checkpoint file
@@ -254,7 +263,7 @@ class World:
         # config file is loaded anywhere in this test and nothing touches the
         # real home directory.
         self.backend = LocalBackend(root=root / "local")
-        self.daemon = Daemon(self.store, self.backend)
+        self.daemon = Daemon(self.store, self.backend, **POLL_EVERY_CYCLE)
 
         # The path the daemon tails. Spelled the same way the daemon spells it,
         # because `sources` is keyed on (run_id, path) and a different spelling
@@ -719,7 +728,7 @@ class TestSubmitMonitorPreemptResume:
                 status="queued",
                 run_dir=str(world.run_dir),
             )
-            replay_daemon = Daemon(replay, world.backend)
+            replay_daemon = Daemon(replay, world.backend, **POLL_EVERY_CYCLE)
 
             expected_events = world.store.count_events(world.run_id)
 

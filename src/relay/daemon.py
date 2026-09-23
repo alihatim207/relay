@@ -86,10 +86,40 @@ EVENTS_FILENAME = "events.jsonl"
 # enough that a human notices within a coffee break.
 STALE_AFTER_SECONDS = 300.0
 
-# The three polling intervals. See `next_interval` for which applies when.
+# The three TAIL intervals: how often the daemon reads new bytes out of the
+# run directories on shared storage. See `next_interval` for which applies
+# when. This is the schedule that makes metrics feel live, and it is cheap --
+# a `tail -c +N` on GPFS, costing whatever the job has printed since last time
+# and nothing else. No other user on the cluster is affected by it.
 INTERVAL_ACTIVE = 2.0  # something is running or producing output
 INTERVAL_QUEUED = 30.0  # runs exist, but they are all waiting in the queue
 INTERVAL_IDLE = 60.0  # nothing to watch at all
+
+# The SCHEDULER interval: how often the daemon asks `squeue` what the jobs are
+# doing. A completely separate schedule from the tail above, and this is the
+# single most important thing to understand about the loop.
+#
+# A tail is a filesystem read. A `squeue` is a question put to slurmctld, one
+# process serving every user on the cluster. Most HPC sites ask users not to
+# poll it more than about once every thirty seconds; an unattended daemon at
+# the tail's two-second cadence would put roughly twenty thousand requests a
+# day into shared infrastructure to learn something that changes perhaps five
+# times in a run's life.
+#
+# So: a floor of thirty seconds that no amount of activity can talk the daemon
+# out of, and a backoff towards SCHEDULER_INTERVAL_MAX while nothing changes.
+# What this costs is latency on a slow-moving fact. A job that starts at
+# 14:03:00 is noticed at 14:03:28 instead. Metrics are unaffected, because
+# they come from the tail.
+SCHEDULER_INTERVAL_MIN = 30.0
+SCHEDULER_INTERVAL_MAX = 300.0
+
+# What the scheduler interval is multiplied by after a poll in which no run
+# changed state. 1.5 rather than 2 so the climb from 30s to the 300s ceiling
+# takes eight polls (about six minutes) instead of four: gentle enough to save
+# most of the requests, slow enough that a user watching a queue does not
+# suddenly find themselves on a five-minute refresh.
+SCHEDULER_BACKOFF_FACTOR = 1.5
 
 # Exponential backoff after whole-cycle failures: 4s, 8s, 16s ... capped.
 # The cap matters more than the growth rate. Without it, a laptop left asleep
@@ -149,6 +179,21 @@ class CycleStats:
     running: int = 0
     queued: int = 0
 
+    # Which of the two schedules actually fired this cycle. A cycle does the
+    # tail if the tail is due and the scheduler poll if the scheduler poll is
+    # due, and most cycles on a live run do only the first: the tail runs every
+    # two seconds while `squeue` is held to thirty or more. Recorded rather
+    # than inferred, because "we asked and got nothing back" and "we did not
+    # ask" look identical from the outside and mean opposite things.
+    tailed: bool = False
+    scheduler_polled: bool = False
+    # True when this cycle's poll was triggered by `store.poke_scheduler()`
+    # (what `relay submit` and `relay cancel` do) rather than by the clock.
+    scheduler_poked: bool = False
+    # What the scheduler interval has backed off to, in seconds, after this
+    # cycle. For the log line and for tests; nothing in the loop reads it.
+    scheduler_interval: float = 0.0
+
     # Ingestion.
     bytes_read: int = 0
     events_parsed: int = 0
@@ -206,10 +251,17 @@ class CycleStats:
 
 
 def next_interval(stats: CycleStats) -> float:
-    """How many seconds to sleep after a cycle that produced `stats`.
+    """How many seconds until the next *tail* after a cycle that produced `stats`.
 
     A pure function of the stats so it can be unit-tested without a daemon, a
     store or a clock.
+
+    This is the filesystem schedule only. How often the daemon asks the
+    scheduler anything is a separate decision with a separate floor, made by
+    `Daemon._scheduler_due` and `Daemon._advance_scheduler_backoff`, and the
+    actual sleep is the sooner of the two (`Daemon._interval_for`). Splitting
+    them is what lets metrics update every two seconds without pointing a
+    two-second polling loop at slurmctld.
 
     The policy, in order of precedence:
 
@@ -223,9 +275,9 @@ def next_interval(stats: CycleStats) -> float:
         is down, hammering it neither fixes it nor helps anyone.
       * something is running, or bytes arrived -> 2 seconds. This is the case
         the user is watching on the dashboard.
-      * runs exist but are all queued -> 30 seconds. A job that starts tomorrow
-        does not become visible faster because we asked squeue 1800 times an
-        hour, and a shared login node has many other users on it.
+      * runs exist but are all queued -> 30 seconds. There is nothing being
+        written to tail while a job sits in the queue, so there is nothing to
+        gain from looking sooner.
       * nothing active at all -> 60 seconds. Just enough to notice a new
         submission promptly.
     """
@@ -367,8 +419,11 @@ class Daemon:
         interval_active: float = INTERVAL_ACTIVE,
         interval_queued: float = INTERVAL_QUEUED,
         interval_idle: float = INTERVAL_IDLE,
+        scheduler_interval_min: float = SCHEDULER_INTERVAL_MIN,
+        scheduler_interval_max: float = SCHEDULER_INTERVAL_MAX,
         usage_interval_seconds: float = USAGE_INTERVAL_SECONDS,
         auth_check_interval: float = AUTH_CHECK_INTERVAL,
+        clock=time.monotonic,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -376,8 +431,21 @@ class Daemon:
         self.interval_active = interval_active
         self.interval_queued = interval_queued
         self.interval_idle = interval_idle
+        self.scheduler_interval_min = scheduler_interval_min
+        # Never below the minimum, whatever a caller passes. `Daemon` is
+        # reachable from tests and from a future API as well as from the CLI,
+        # and a ceiling under the floor would make `_advance_scheduler_backoff`
+        # shrink the interval instead of growing it.
+        self.scheduler_interval_max = max(scheduler_interval_max, scheduler_interval_min)
         self.usage_interval_seconds = usage_interval_seconds
         self.auth_check_interval = auth_check_interval
+
+        # The clock, injectable so a test can drive both schedules without
+        # sleeping through them. It must be *monotonic*: these are elapsed-time
+        # decisions, and a laptop that syncs its clock (or crosses a daylight
+        # saving boundary) mid-cycle would otherwise either stall the loop for
+        # an hour or hammer the controller for one.
+        self._now = clock
 
         # Consecutive whole-cycle failures. The only cross-cycle state in the
         # process, and losing it on a restart costs nothing: a restarted daemon
@@ -391,6 +459,29 @@ class Daemon:
         # that has just restarted *should* check immediately. There is nothing
         # here worth surviving a restart.
         self._last_auth_check: float | None = None
+
+        # The scheduler schedule. `_last_scheduler_poll` is a monotonic
+        # reading, None until the first poll -- so a daemon that has just
+        # started polls immediately, which is what a user who just ran
+        # `relay daemon` expects to happen.
+        #
+        # `_scheduler_interval` is the current backoff, reset to the minimum
+        # whenever anything changes. In memory rather than in the database for
+        # the same reason as `_last_auth_check`: a restarted daemon should
+        # start fresh and look straight away.
+        self._last_scheduler_poll: float | None = None
+        self._scheduler_interval = float(scheduler_interval_min)
+
+        # The last `scheduler_poke_ts` we have already acted on. `submit` and
+        # `cancel` write that key to say "look now"; comparing against the last
+        # value we saw turns a persistent timestamp into a one-shot trigger
+        # without either process having to clear it.
+        #
+        # Seeded from the store rather than from None so that a daemon
+        # starting up long after the last submit does not treat an ancient poke
+        # as news. It polls immediately anyway, because
+        # `_last_scheduler_poll` is None.
+        self._seen_poke: str | None = store.scheduler_poke()
 
     # -- one cycle ---------------------------------------------------------
 
@@ -425,7 +516,22 @@ class Daemon:
         runs = self.store.list_runs(active_only=True)
         stats.runs_checked = len(runs)
 
-        statuses = self._batched_status(runs, stats)
+        # The two schedules, decided once, up front. A cycle does whichever of
+        # them is due; on a live run that is usually the tail alone, because
+        # the tail runs every two seconds and the scheduler poll is held to
+        # thirty or more.
+        poll_scheduler = self._scheduler_due(runs, stats)
+        # The tail has no separate gate: `run_forever` sleeps until the sooner
+        # of the two schedules, so if we woke up and the scheduler was not the
+        # reason, the tail was. Driving `run_once` directly (which the tests
+        # do) tails every call, which is the least surprising behaviour for a
+        # method whose whole job is "do one pass".
+        stats.tailed = True
+
+        statuses = self._batched_status(runs, stats) if poll_scheduler else {}
+        if poll_scheduler:
+            stats.scheduler_polled = True
+            self._last_scheduler_poll = self._now()
 
         # Did any run finish during this cycle? If so we take its final usage
         # reading now rather than whenever the five-minute timer next comes
@@ -442,6 +548,11 @@ class Daemon:
             # of a run's log -- whereas marking a run terminal first would drop
             # it out of `list_runs(active_only=True)` and we would never come
             # back for those final bytes.
+            #
+            # On a cycle with no scheduler poll, `statuses` is empty and
+            # `_sync_status` is a no-op for every run. That is correct rather
+            # than merely harmless: with nothing new from the scheduler there
+            # is no new opinion to apply, and the run keeps the status it had.
             self._sync_events(run, stats)
             went_terminal |= self._sync_status(run, statuses, stats)
             self._check_stale(run, stats)
@@ -451,6 +562,15 @@ class Daemon:
             elif run["status"] == "queued":
                 stats.queued += 1
 
+        # Grow or reset the backoff, but only on a cycle that actually asked.
+        # A cycle that skipped the poll learned nothing about whether anything
+        # changed, and treating "did not look" as "nothing happened" would let
+        # the interval climb to its ceiling without a single question having
+        # been put to the scheduler.
+        if poll_scheduler:
+            self._advance_scheduler_backoff(stats)
+        stats.scheduler_interval = self._scheduler_interval
+
         # Usage comes last in the cycle on purpose: it depends on the statuses
         # we have just written (that is how it knows which runs are finished),
         # and it is the one thing here nobody is watching in real time.
@@ -458,8 +578,23 @@ class Daemon:
             self._fetch_usage(stats)
 
         stats.failed = self._cycle_failed(stats)
+        neutral = False
         if stats.failed:
             self.consecutive_failures += 1
+        elif self.consecutive_failures and not self._touched_cluster(stats):
+            neutral = True
+            # Mid-outage, and this cycle asked the cluster nothing -- there was
+            # nothing to tail and the scheduler poll was not due. So it learned
+            # nothing, and it is neither a success nor a failure.
+            #
+            # This case only exists because the two schedules are independent:
+            # before they were split, every cycle made at least one call and
+            # "did not fail" really did mean "something worked". Letting a
+            # cycle that made no call clear the failure streak would reset the
+            # backoff during an outage, and stamping it as a successful sync
+            # would put a fresh "metrics 0s ago" under `relay ls` on the
+            # strength of having done nothing at all.
+            pass
         else:
             self.consecutive_failures = 0
             # "Last synced" only means something if the cycle actually worked.
@@ -467,20 +602,37 @@ class Daemon:
             # one thing we refuse to do.
             self.store.mark_synced()
 
-        self._record_cycle_health(state, stats)
+        # Two freshness stamps, because there are two schedules. This one says
+        # when the scheduler last answered, and `relay ls` shows it next to the
+        # metric freshness so a user can see which of the two numbers on screen
+        # is the older one. Only on a poll that actually succeeded: the whole
+        # point of the line is that the user can trust it.
+        if stats.scheduler_polled and not stats.status_failed:
+            self.store.mark_scheduler_synced()
+
+        # The same rule for the daemon_state row. A neutral cycle has no
+        # verdict on the channel, so it must not clear the stored error or
+        # stamp `last_ok_ts`; otherwise the "cluster unreachable" line under
+        # `relay ls` would blink off on every in-between cycle of an outage
+        # and back on at the next real attempt.
+        if not neutral:
+            self._record_cycle_health(state, stats)
         stats.consecutive_failures = self.consecutive_failures
 
         self.cycles += 1
         stats.duration_s = time.monotonic() - started
 
         log.debug(
-            "cycle: %d runs, %d bytes, %d events (+%d new), %d errors, %.3fs",
+            "cycle: %d runs, %d bytes, %d events (+%d new), %d errors, %.3fs, "
+            "scheduler %s (next in %gs)",
             stats.runs_checked,
             stats.bytes_read,
             stats.events_parsed,
             stats.events_inserted,
             stats.errors,
             stats.duration_s,
+            "polled" if stats.scheduler_polled else "skipped",
+            self._scheduler_interval,
         )
         return stats
 
@@ -809,6 +961,86 @@ class Daemon:
 
     # -- step 5: what the scheduler charged us -----------------------------
 
+    # -- the scheduler's own schedule --------------------------------------
+
+    def _scheduler_due(self, runs: list[dict], stats: CycleStats) -> bool:
+        """Should this cycle ask `squeue` anything?
+
+        Three ways to get a yes, and none of them is "a job is running". That
+        omission is the point: how busy the user's runs are says nothing about
+        how much load slurmctld should be asked to carry, and letting activity
+        drive this is exactly how a two-second polling loop ends up pointed at
+        shared infrastructure.
+
+          * we have never polled -- a daemon that has just started should look
+            immediately rather than making the user wait out an interval to
+            find out what their jobs are doing.
+          * `submit` or `cancel` poked us. The user has just done something and
+            is watching for the result, and the backoff is probably at its most
+            relaxed precisely because nothing had been happening.
+          * the interval has elapsed.
+
+        A run with no job ID is not a reason to poll, but it is also not a
+        reason *not* to: `_batched_status` filters those out on its own and
+        returns without a call if nothing is left, so a cycle whose only runs
+        are unsubmitted costs nothing either way.
+        """
+        if self._poked():
+            # Recorded on the stats so `_advance_scheduler_backoff` treats it
+            # as a change: a poke means the picture is about to move, so the
+            # next few polls should be at the fast end too. The reset itself
+            # happens there, so that "poke, then no-change poll" ends this
+            # cycle at the floor and not one backoff step above it.
+            stats.scheduler_poked = True
+            return True
+        if self._last_scheduler_poll is None:
+            return True
+        elapsed = self._now() - self._last_scheduler_poll
+        return elapsed >= self._scheduler_interval
+
+    def _poked(self) -> bool:
+        """Has `submit` or `cancel` asked for a prompt poll since we last looked?
+
+        Reads the timestamp `store.poke_scheduler` writes and compares it with
+        the last one we acted on. Comparing rather than clearing keeps this a
+        read-only check from the daemon's side, so the CLI and the daemon never
+        write the same key and there is no race to lose.
+        """
+        poke = self.store.scheduler_poke()
+        if poke is None or poke == self._seen_poke:
+            return False
+        self._seen_poke = poke
+        return True
+
+    def _advance_scheduler_backoff(self, stats: CycleStats) -> None:
+        """Grow the scheduler interval, or snap it back to the floor.
+
+        Called only after a cycle that actually polled.
+
+        Anything moving resets it: a status change, which covers a job
+        starting, finishing, being preempted or being cancelled, whoever
+        noticed first; or a poke from `submit` or `cancel`, which is the user
+        telling us something is about to move. Nothing moving multiplies it by
+        `SCHEDULER_BACKOFF_FACTOR` up to the ceiling. Twenty minutes into a
+        twelve-hour run that nobody has touched, relay is asking `squeue` once
+        every five minutes, which is the right amount of attention to pay to a
+        fact that will not change for hours.
+
+        A failed poll neither grows nor resets the interval. Growing would
+        punish the user for a network blip by making recovery slower, and the
+        whole-cycle backoff in `next_interval` already handles a transport that
+        is genuinely down.
+        """
+        if stats.status_failed:
+            return
+        if stats.status_changes > 0 or stats.scheduler_poked:
+            self._scheduler_interval = self.scheduler_interval_min
+            return
+        self._scheduler_interval = min(
+            self.scheduler_interval_max,
+            self._scheduler_interval * SCHEDULER_BACKOFF_FACTOR,
+        )
+
     def _usage_due(self, state: dict, *, forced: bool) -> bool:
         """Is it time to ask the scheduler for usage numbers?
 
@@ -913,6 +1145,20 @@ class Daemon:
             return True
         return stats.status_failed and stats.read_attempts == 0
 
+    def _touched_cluster(self, stats: CycleStats) -> bool:
+        """Did this cycle actually put a question to the cluster?
+
+        A cycle with active runs normally reads at least one event log, so this
+        is nearly always True. It is False in two situations: there are no
+        active runs at all (a healthy idle daemon), and every active run is
+        still waiting for a run directory to exist while the scheduler poll is
+        not due.
+
+        Only used to decide whether an otherwise-uneventful cycle is allowed to
+        clear a failure streak. See `run_once`.
+        """
+        return stats.read_attempts > 0 or stats.scheduler_polled
+
     # -- the loop ----------------------------------------------------------
 
     def run_forever(self, stop_event: threading.Event | None = None) -> int:
@@ -948,23 +1194,47 @@ class Daemon:
         return self.cycles
 
     def _interval_for(self, stats: CycleStats) -> float:
-        """`next_interval`, but honouring this instance's overrides.
+        """How long to sleep after this cycle: whichever schedule is due first.
 
-        The module-level function holds the policy (and stays pure, so it is
-        trivial to test); this method only substitutes the instance's intervals
-        for the defaults, which exists so a test can run a real loop without
-        waiting two seconds a cycle.
+        Two schedules run inside one single-threaded loop, so the sleep is the
+        sooner of them and the next cycle works out which one it woke up for.
+        A second thread for the scheduler poll would be the sophisticated
+        alternative; it would also mean two things writing to one SQLite
+        connection and a lock to get wrong, to save a comparison.
+
+        Authentication and transport backoff short-circuit both schedules.
+        When the daemon is locked out or the cluster is unreachable, neither a
+        tail nor a `squeue` would succeed, so there is nothing to be gained by
+        waking for either.
         """
         base = next_interval(stats)
         if stats.auth_required:
             return self.auth_check_interval
         if stats.consecutive_failures > 0:
             return base
+
         if base == INTERVAL_ACTIVE:
-            return self.interval_active
-        if base == INTERVAL_QUEUED:
-            return self.interval_queued
-        return self.interval_idle
+            tail = self.interval_active
+        elif base == INTERVAL_QUEUED:
+            tail = self.interval_queued
+        else:
+            tail = self.interval_idle
+
+        return min(tail, self._scheduler_sleep())
+
+    def _scheduler_sleep(self) -> float:
+        """Seconds until the scheduler poll is next due, floored at zero.
+
+        Zero is a real answer, not an error: it means the poll is already
+        overdue, which happens whenever a tail interval is longer than what is
+        left of the scheduler interval. `_interval_for` takes a `min` with the
+        tail interval, so a zero here simply means the next cycle happens as
+        soon as this one finishes -- and that cycle will poll.
+        """
+        if self._last_scheduler_poll is None:
+            return 0.0
+        remaining = self._scheduler_interval - (self._now() - self._last_scheduler_poll)
+        return max(0.0, remaining)
 
 
 # --------------------------------------------------------------------------
@@ -1055,6 +1325,58 @@ def build_backend(conf: "cfg.Config", *, runner=None):
     raise ValueError(f"unknown backend {conf.backend!r} in {cfg.config_path()}")
 
 
+def daemon_intervals(conf: "cfg.Config", overrides: dict | None = None) -> dict:
+    """The six polling intervals, as keyword arguments for `Daemon`.
+
+    One function because the values come from two places -- the `daemon:`
+    section of the config file and `relay daemon`'s own flags -- and the rule
+    ("a flag beats the file") has to live somewhere single. `overrides` holds
+    only the flags the user actually passed; argparse leaves the rest as None
+    and they are dropped here, so "not given" stays distinguishable from
+    "given the default value".
+
+    `scheduler_interval_min` is re-clamped after the merge rather than trusted
+    from either source, because the flag has not been through the config
+    validator and relay's floor is a limit on what relay will do, not on what a
+    config file may say.
+    """
+    supplied = {key: value for key, value in (overrides or {}).items() if value is not None}
+
+    values = {
+        "interval_active": conf.daemon.tail_interval_active,
+        "interval_queued": conf.daemon.tail_interval_queued,
+        "interval_idle": conf.daemon.tail_interval_idle,
+        "scheduler_interval_min": conf.daemon.scheduler_interval_min,
+        "scheduler_interval_max": conf.daemon.scheduler_interval_max,
+        "usage_interval_seconds": conf.daemon.usage_interval,
+    }
+    values.update(supplied)
+
+    values["scheduler_interval_min"] = cfg.clamp_scheduler_interval(
+        values["scheduler_interval_min"],
+        source=(
+            "--scheduler-interval-min"
+            if "scheduler_interval_min" in supplied
+            else str(cfg.config_path())
+        ),
+    )
+    # The ceiling cannot sit below the floor. The config validator rejects that
+    # combination outright, but a flag can still produce it -- `--scheduler-
+    # interval-min 120` against a config ceiling of 60 -- and refusing to start
+    # the daemon over it would be a poor trade for the user.
+    if values["scheduler_interval_max"] < values["scheduler_interval_min"]:
+        log.warning(
+            "scheduler_interval_max (%gs) is below scheduler_interval_min (%gs); "
+            "using %gs for both, so the poll runs at a fixed interval with no backoff.",
+            values["scheduler_interval_max"],
+            values["scheduler_interval_min"],
+            values["scheduler_interval_min"],
+        )
+        values["scheduler_interval_max"] = values["scheduler_interval_min"]
+
+    return values
+
+
 def main(
     store_path: str | os.PathLike | None = None,
     *,
@@ -1062,12 +1384,17 @@ def main(
     lock_path: str | os.PathLike | None = None,
     stop_event: threading.Event | None = None,
     runner=None,
+    intervals: dict | None = None,
 ) -> int:
     """Run the daemon until it is asked to stop. Returns a process exit code.
 
     The CLI calls this for `relay daemon`. Everything it does is arrangement:
     take the lock, build a store and a backend, arrange for signals to set the
     stop flag, loop, then put everything back.
+
+    `intervals` carries `relay daemon`'s interval flags -- only the ones the
+    user gave, the rest None -- and is merged onto the config by
+    `daemon_intervals`.
 
     Signal handlers only *set a flag*. They do not touch the database, print,
     or raise. A handler runs between bytecodes at an arbitrary point -- possibly
@@ -1091,8 +1418,19 @@ def main(
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous[signum] = signal.signal(signum, _request_stop)
 
-    daemon = Daemon(store, build_backend(conf, runner=runner))
-    log.info("daemon started (backend=%s, db=%s)", conf.backend, store.path)
+    resolved = daemon_intervals(conf, intervals)
+    daemon = Daemon(store, build_backend(conf, runner=runner), **resolved)
+    log.info(
+        "daemon started (backend=%s, db=%s); tail every %g-%gs, scheduler no more "
+        "often than every %gs (backing off to %gs), usage every %gs",
+        conf.backend,
+        store.path,
+        resolved["interval_active"],
+        resolved["interval_idle"],
+        resolved["scheduler_interval_min"],
+        resolved["scheduler_interval_max"],
+        resolved["usage_interval_seconds"],
+    )
 
     try:
         daemon.run_forever(stop_event)

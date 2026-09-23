@@ -828,6 +828,8 @@ FAKE_LS = {
     ],
     "last_synced": "2026-09-18T12:00:00.000Z",
     "last_synced_age_s": 5.0,
+    "last_scheduler": "2026-09-18T11:58:00.000Z",
+    "last_scheduler_age_s": 125.0,
 }
 
 
@@ -841,7 +843,10 @@ def test_ls_table_and_json_are_two_renderings_of_one_answer(capsys, monkeypatch)
     assert "vr_s1_ab12" in table
     assert "(stale)" in table
     assert "loss=0.412" in table
-    assert "last synced 5s ago" in table
+    # Both clocks, and they disagree on purpose: the tail runs every couple of
+    # seconds, the scheduler poll every thirty at the very least.
+    assert "metrics 5s ago" in table
+    assert "job state 2m ago" in table
 
     assert cli.main(["ls", "--json"]) == cli.EXIT_OK
     parsed = json.loads(capsys.readouterr().out)
@@ -872,6 +877,79 @@ def test_ls_reads_real_rows_and_hides_finished_runs_without_all(capsys):
     assert cli.main(["ls", "--all", "--json"]) == cli.EXIT_OK
     every = json.loads(capsys.readouterr().out)
     assert {r["run_id"] for r in every["runs"]} == {"live", "done"}
+
+
+# --------------------------------------------------------------------------
+# The two freshness clocks in the footer
+# --------------------------------------------------------------------------
+#
+# The daemon tails the event logs every couple of seconds and asks `squeue`
+# every thirty at the very least, so the two halves of what `ls` shows have
+# genuinely different ages. One "last synced" number would have to print the
+# older of them and make a healthy daemon look stalled.
+
+
+def test_sync_line_shows_both_ages_when_both_clocks_have_run():
+    line = cli._sync_line(
+        {
+            "last_synced": "2026-09-18T12:00:00.000Z",
+            "last_synced_age_s": 3.0,
+            "last_scheduler": "2026-09-18T11:56:00.000Z",
+            "last_scheduler_age_s": 240.0,
+        }
+    )
+    assert line == "metrics 3s ago · job state 4m ago"
+
+
+def test_sync_line_says_never_polled_when_the_scheduler_clock_is_unset():
+    """A daemon that is tailing but has not managed a `squeue` yet."""
+    line = cli._sync_line(
+        {
+            "last_synced": "2026-09-18T12:00:00.000Z",
+            "last_synced_age_s": 3.0,
+            "last_scheduler": None,
+            "last_scheduler_age_s": None,
+        }
+    )
+    assert line == "metrics 3s ago · job state never polled"
+
+
+def test_sync_line_keeps_the_old_sentence_when_nothing_has_synced_at_all():
+    """No daemon at all is a different problem, and still says what to run."""
+    line = cli._sync_line(
+        {"last_synced": None, "last_synced_age_s": None, "last_scheduler": None}
+    )
+    assert line == "last synced never — is `relay daemon` running?"
+
+
+def test_sync_footer_carries_both_clocks(monkeypatch):
+    with Store(cfg.db_path()) as store:
+        store.mark_synced("2026-09-18T12:00:00.000Z")
+        store.mark_scheduler_synced("2026-09-18T11:58:00.000Z")
+        footer = cli._sync_footer(store)
+
+    assert footer["last_synced"] == "2026-09-18T12:00:00.000Z"
+    assert footer["last_scheduler"] == "2026-09-18T11:58:00.000Z"
+    # Both ages are real numbers, and the scheduler's is the older one.
+    assert footer["last_scheduler_age_s"] > footer["last_synced_age_s"] > 0
+    assert "daemon_state" in footer
+
+
+def test_ls_json_carries_the_scheduler_clock(capsys):
+    """Scripts parse `--json`, so both clocks have to be in the data."""
+    seed_run("live", status="running")
+    with Store(cfg.db_path()) as store:
+        store.mark_synced()
+        store.mark_scheduler_synced()
+
+    assert cli.main(["ls", "--json"]) == cli.EXIT_OK
+    parsed = json.loads(capsys.readouterr().out)
+    # The original three keys are untouched -- scripts already read them.
+    assert parsed["last_synced"] is not None
+    assert parsed["last_synced_age_s"] is not None
+    assert "daemon_state" in parsed
+    assert parsed["last_scheduler"] is not None
+    assert parsed["last_scheduler_age_s"] is not None
 
 
 # --------------------------------------------------------------------------
@@ -1082,6 +1160,51 @@ def test_cancel_without_config_exits_not_configured(capsys):
     seed_run("vr")
     assert cli.main(["cancel", "vr"]) == cli.EXIT_NOT_CONFIGURED
     assert "relay init" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Poking the daemon's scheduler poll
+# --------------------------------------------------------------------------
+#
+# The poll backs off towards five minutes while nothing changes. Submitting or
+# cancelling is exactly when the user starts watching for a result, so both
+# leave a timestamp the daemon reads as "look now".
+
+
+def test_submit_pokes_the_scheduler(tmp_path, local_config, fake_backend):
+    script = tmp_path / "train.py"
+    script.write_text("print('hi')\n", encoding="utf-8")
+
+    with Store(cfg.db_path()) as store:
+        assert store.scheduler_poke() is None
+
+    assert cli.main(["submit", str(script)]) == cli.EXIT_OK
+
+    with Store(cfg.db_path()) as store:
+        assert store.scheduler_poke() is not None
+
+
+def test_submit_pokes_once_for_a_whole_sweep(tmp_path, local_config, fake_backend):
+    """One note, not one per seed: five seeds still mean one "look now"."""
+    script = tmp_path / "train.py"
+    script.write_text("print('hi')\n", encoding="utf-8")
+
+    assert cli.main(["submit", str(script), "--seeds", "0-4"]) == cli.EXIT_OK
+
+    with Store(cfg.db_path()) as store:
+        assert store.scheduler_poke() is not None
+        assert len(store.list_runs()) == 5
+
+
+def test_cancel_pokes_the_scheduler(local_config, fake_backend):
+    seed_run("vr", job_id="4242")
+    with Store(cfg.db_path()) as store:
+        assert store.scheduler_poke() is None
+
+    assert cli.main(["cancel", "vr"]) == cli.EXIT_OK
+
+    with Store(cfg.db_path()) as store:
+        assert store.scheduler_poke() is not None
 
 
 # --------------------------------------------------------------------------
@@ -1423,6 +1546,8 @@ FAKE_USAGE = {
     },
     "last_synced": "2026-09-18T12:00:00.000Z",
     "last_synced_age_s": 5.0,
+    "last_scheduler": "2026-09-18T11:58:00.000Z",
+    "last_scheduler_age_s": 125.0,
     "daemon_state": {"last_error_kind": None},
 }
 
@@ -1439,7 +1564,7 @@ def test_usage_table_and_json_are_two_renderings_of_one_answer(capsys, monkeypat
     assert "runs: crashed" in table
     assert "no checkpoints reported" in table
     assert "$8.00" in table  # cost, because a rate was configured
-    assert "last synced 5s ago" in table
+    assert "metrics 5s ago · job state 2m ago" in table
 
     assert cli.main(["usage", "--json"]) == cli.EXIT_OK
     parsed = json.loads(capsys.readouterr().out)
@@ -1484,7 +1609,9 @@ def test_usage_human_output_has_the_table_totals_and_wasted_block(capsys, usage_
     assert "Wasted" in out
     assert "runs: crashed" in out
     assert "no checkpoints reported — your script is not printing checkpoint lines" in out
-    assert "last synced" in out
+    # Nothing in this test ran a daemon cycle, so the footer is the "never"
+    # sentence rather than the two ages.
+    assert "last synced never" in out
     assert "$" not in out
 
 
@@ -1706,6 +1833,99 @@ def test_daemon_already_running_exits_failure(capsys, monkeypatch):
     assert code == cli.EXIT_FAILURE
     assert lock in err
     assert "Traceback" not in err
+
+
+# --------------------------------------------------------------------------
+# relay daemon's interval flags
+# --------------------------------------------------------------------------
+#
+# The CLI's whole job here is plumbing: turn six flags into the override dict
+# `daemon_intervals` merges onto the config. The merge itself is tested in
+# test_daemon.py, so these tests stop at the boundary and check that each flag
+# arrives under the right key.
+
+
+@pytest.fixture
+def captured_daemon(monkeypatch):
+    """Replace the daemon's main with one that records its keyword arguments."""
+    calls: list[dict] = []
+
+    def fake_main(*args, **kwargs):
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(daemon_module, "main", fake_main)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "flag,key",
+    [
+        # The flag names describe what is being tuned; the keys are `Daemon`'s
+        # own parameter names. The two deliberately differ, which is exactly
+        # why this mapping is worth a test.
+        ("--tail-interval-active", "interval_active"),
+        ("--tail-interval-queued", "interval_queued"),
+        ("--tail-interval-idle", "interval_idle"),
+        ("--scheduler-interval-min", "scheduler_interval_min"),
+        ("--scheduler-interval-max", "scheduler_interval_max"),
+        ("--usage-interval", "usage_interval_seconds"),
+    ],
+)
+def test_each_interval_flag_reaches_the_daemon_under_its_own_key(
+    captured_daemon, flag, key
+):
+    assert cli.main(["daemon", flag, "12.5"]) == cli.EXIT_OK
+
+    intervals = captured_daemon[0]["intervals"]
+    assert intervals[key] == 12.5
+    # Everything else is None, so the config keeps its say over the five the
+    # user did not mention.
+    assert all(value is None for name, value in intervals.items() if name != key)
+
+
+def test_daemon_with_no_flags_overrides_nothing(captured_daemon):
+    """Every value None means "the config decides", not "use these numbers"."""
+    assert cli.main(["daemon"]) == cli.EXIT_OK
+
+    intervals = captured_daemon[0]["intervals"]
+    assert set(intervals) == {
+        "interval_active",
+        "interval_queued",
+        "interval_idle",
+        "scheduler_interval_min",
+        "scheduler_interval_max",
+        "usage_interval_seconds",
+    }
+    assert all(value is None for value in intervals.values())
+
+
+def test_daemon_flags_can_be_combined(captured_daemon):
+    code = cli.main(
+        ["daemon", "--tail-interval-active", "0.5", "--scheduler-interval-max", "600"]
+    )
+    assert code == cli.EXIT_OK
+
+    intervals = captured_daemon[0]["intervals"]
+    assert intervals["interval_active"] == 0.5
+    assert intervals["scheduler_interval_max"] == 600.0
+    assert intervals["scheduler_interval_min"] is None
+
+
+def test_daemon_help_says_the_flags_beat_the_config(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["daemon", "--help"])
+    out = capsys.readouterr().out
+    assert "--scheduler-interval-min" in out
+    assert "--usage-interval" in out
+    assert "config" in out
+
+
+def test_daemon_rejects_a_non_numeric_interval(capsys):
+    """argparse's own type check, which is exit code 2 for free."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["daemon", "--tail-interval-active", "soon"])
+    assert exc.value.code == cli.EXIT_USAGE
 
 
 # --------------------------------------------------------------------------

@@ -85,7 +85,16 @@ def test_runs_list_shape(client):
     assert response.status_code == 200
     body = response.json()
 
-    assert set(body) == {"runs", "daemon_state", "last_synced", "last_synced_age_seconds"}
+    assert set(body) == {
+        "runs",
+        "daemon_state",
+        "last_synced",
+        "last_synced_age_seconds",
+        # The scheduler poll is a second, slower clock; see the freshness
+        # tests at the bottom of this file.
+        "last_scheduler",
+        "last_scheduler_age_seconds",
+    }
     assert body["last_synced"] is not None
     # The daemon synced a moment ago, so the age is a small non-negative number.
     assert 0 <= body["last_synced_age_seconds"] < 60
@@ -522,3 +531,86 @@ def test_page_shows_no_checkpoints_and_per_attempt_usage(client):
     page = client.get("/").text
     assert "no checkpoints reported" in page
     assert 'id="attempts-body"' in page
+
+
+# --------------------------------------------------------------------------
+# Two freshness clocks
+# --------------------------------------------------------------------------
+#
+# The daemon polls two things on two independent schedules: it tails the event
+# logs on the shared filesystem every couple of seconds, and it asks the
+# scheduler for job state no more often than every thirty seconds, backing off
+# from there. So there are two "how old is this" numbers, and the page has to
+# show both -- metrics two seconds old next to job state forty seconds old is
+# the normal healthy state, and one number would hide it.
+#
+# These tests never call `mark_synced`, only `mark_scheduler_synced`, which is
+# what proves the two are genuinely independent rather than two names for the
+# same write.
+
+UNSYNCED_RUN = "vr_fresh"
+
+
+@pytest.fixture()
+def unsynced_db(tmp_path):
+    """A database the daemon has never synced: one run, no sync timestamps."""
+    path = tmp_path / "unsynced.db"
+    with Store(path) as store:
+        store.create_run(UNSYNCED_RUN, backend="local", name="fresh", status="queued")
+    return path
+
+
+@pytest.fixture()
+def unsynced_client(unsynced_db):
+    with TestClient(create_app(store_path=str(unsynced_db))) as test_client:
+        test_client.db_path = unsynced_db
+        yield test_client
+
+
+def _freshness_payloads(client):
+    """The three payloads that carry freshness, keyed by a readable name."""
+    return {
+        "runs": client.get("/api/runs").json(),
+        "detail": client.get(f"/api/runs/{UNSYNCED_RUN}").json(),
+        "usage": client.get("/api/usage").json(),
+    }
+
+
+def test_scheduler_freshness_is_null_before_the_first_poll(unsynced_client):
+    """Never polled is a null, not a missing key or a zero.
+
+    A missing key would make the page's null check depend on whether the
+    daemon had ever run; a zero would read as "just now", which is the exact
+    opposite of the truth.
+    """
+    for where, body in _freshness_payloads(unsynced_client).items():
+        assert body["last_scheduler"] is None, where
+        assert body["last_scheduler_age_seconds"] is None, where
+        # Nothing has been synced at all yet, so the other clock is null too.
+        assert body["last_synced"] is None, where
+        assert body["last_synced_age_seconds"] is None, where
+
+
+def test_scheduler_freshness_moves_without_the_metrics_clock(unsynced_client):
+    """A scheduler poll advances one clock and leaves the other alone."""
+    with Store(unsynced_client.db_path) as store:
+        store.mark_scheduler_synced()
+
+    for where, body in _freshness_payloads(unsynced_client).items():
+        assert isinstance(body["last_scheduler"], str), where
+        assert 0 <= body["last_scheduler_age_seconds"] < 60, where
+        # `mark_synced` was never called, so the filesystem clock has not
+        # moved. If these two shared a timestamp this is where it would show.
+        assert body["last_synced"] is None, where
+        assert body["last_synced_age_seconds"] is None, where
+
+
+def test_page_shows_both_ages_in_one_line(client):
+    """The header says which number belongs to which clock, in plain words."""
+    page = client.get("/").text
+    assert "function renderSync(metricsAge, schedulerAge)" in page
+    assert "'metrics '" in page
+    assert "job state never polled" in page
+    # Both call sites pass the scheduler age through.
+    assert "renderSync(data.last_synced_age_seconds, data.last_scheduler_age_seconds)" in page
+    assert "renderSync(run.last_synced_age_seconds, run.last_scheduler_age_seconds)" in page

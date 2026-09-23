@@ -85,6 +85,23 @@ META_LAST_SYNC_TS = "last_sync_ts"  # when the daemon last finished a full cycle
 META_DAEMON_STARTED_TS = "daemon_started_ts"  # when the running daemon booted
 META_SCHEMA_VERSION = "schema_version"  # bumped only if the schema changes shape
 
+# The daemon polls the *filesystem* (the event logs) and the *scheduler*
+# (`squeue`) on two different schedules, because they cost two very different
+# things: a tail is a read on shared storage, while a squeue is a question put
+# to slurmctld, which every user on the cluster shares. So there are two
+# freshness timestamps, not one, and `relay ls` shows both -- metrics two
+# seconds old alongside job state thirty seconds old is the normal, healthy
+# state of affairs, and a single "last synced" number would hide it.
+META_LAST_SCHEDULER_TS = "last_scheduler_ts"  # last successful scheduler poll
+
+# Set by `submit` and `cancel` to tell the daemon "something just changed that
+# you will want to see". The daemon's scheduler poll backs off while nothing is
+# happening (up to five minutes), and without this a freshly submitted run
+# could sit invisible for that whole time. It lives in `meta` rather than in a
+# `daemon_state` column precisely because `meta` is key/value: a new well-known
+# key needs no ALTER TABLE, so an existing database picks this up for free.
+META_SCHEDULER_POKE_TS = "scheduler_poke_ts"
+
 # 1 -> 2 added usage accounting: the `usage` and `daemon_state` tables and the
 # `runs.attempts` / `runs.usage_final` columns. Nothing was removed or renamed,
 # so an old database is migrated forward in place (see `_migrate`).
@@ -1320,8 +1337,12 @@ class Store:
     def mark_synced(self, ts: str | None = None) -> str:
         """Record that the daemon just finished a cycle; returns the timestamp.
 
-        `relay ls` prints "last synced Ns ago" from this. Showing stale data is
+        `relay ls` prints "metrics Ns ago" from this. Showing stale data is
         acceptable; showing stale data as though it were current is not.
+
+        This is the *filesystem* side of the daemon's work -- the event logs it
+        tailed. What the scheduler said is a separate question on a separate
+        schedule; see `mark_scheduler_synced`.
         """
         stamp = ts or utc_now_iso()
         self.meta_set(META_LAST_SYNC_TS, stamp)
@@ -1329,6 +1350,50 @@ class Store:
 
     def last_synced(self) -> str | None:
         return self.meta_get(META_LAST_SYNC_TS)
+
+    def mark_scheduler_synced(self, ts: str | None = None) -> str:
+        """Record a successful scheduler poll; returns the timestamp.
+
+        Separate from `mark_synced` because the two run on separate schedules:
+        the tail every couple of seconds, the scheduler poll at thirty seconds
+        and backing off from there. A user looking at `relay ls` needs to know
+        which of the two numbers on screen is the old one.
+        """
+        stamp = ts or utc_now_iso()
+        self.meta_set(META_LAST_SCHEDULER_TS, stamp)
+        return stamp
+
+    def last_scheduler_synced(self) -> str | None:
+        return self.meta_get(META_LAST_SCHEDULER_TS)
+
+    def poke_scheduler(self, ts: str | None = None) -> str:
+        """Tell the daemon to poll the scheduler promptly; returns the timestamp.
+
+        Called by `submit` and `cancel`. Those are the two moments when the
+        user has just done something whose result they are about to watch for,
+        and they are also exactly the moments when the daemon's backoff is
+        likely to be at its most relaxed -- nothing had changed for a while,
+        which is why it backed off in the first place.
+
+        A timestamp rather than a boolean flag, so the daemon can tell a poke
+        it has already acted on from a new one without having to clear it.
+        Clearing would need a write from the daemon on every cycle, and two
+        processes writing one flag is a race for no benefit.
+
+        The sophisticated alternative is a real notification -- a socket, a
+        pipe, `inotify` on the database file -- which would wake the daemon
+        instantly instead of at its next cycle. It is not worth it: the daemon's
+        next cycle is at most sixty seconds away even when fully idle, and a
+        socket is another thing to bind, clean up and get wrong on a laptop
+        that sleeps.
+        """
+        stamp = ts or utc_now_iso()
+        self.meta_set(META_SCHEDULER_POKE_TS, stamp)
+        return stamp
+
+    def scheduler_poke(self) -> str | None:
+        """The last poke timestamp, or None if nobody has ever poked."""
+        return self.meta_get(META_SCHEDULER_POKE_TS)
 
 
 # --------------------------------------------------------------------------

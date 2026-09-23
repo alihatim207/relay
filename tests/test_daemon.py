@@ -20,6 +20,8 @@ is a test that fails on a loaded CI machine.
 
 from __future__ import annotations
 
+import inspect
+import logging
 import stat
 import threading
 import time
@@ -28,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from relay import config as config_module
 from relay import daemon as daemon_module
 from relay import ssh as ssh_module
 from relay.backends.base import Backend, JobSpec, UsageRow
@@ -601,7 +604,10 @@ def test_consecutive_failures_grow_then_reset(store, backend, tmp_path):
     store.create_run("vr_x", backend="fake", job_id="7", status="queued")
     backend.status_error = ConnectionError("ssh: Operation timed out")
 
-    daemon = Daemon(store, backend)
+    # Every cycle must actually reach the scheduler for this test to be about
+    # backoff rather than about scheduling: with relay's real 30s floor, cycles
+    # two and three would skip the poll and so neither fail nor succeed.
+    daemon = Daemon(store, backend, scheduler_interval_min=0, scheduler_interval_max=0)
     sleeps = []
     for _ in range(3):
         stats = daemon.run_once()
@@ -1220,6 +1226,11 @@ def test_run_forever_tails_a_real_local_run_until_stopped(tmp_path):
                 interval_active=0.05,
                 interval_queued=0.05,
                 interval_idle=0.05,
+                # The scheduler poll is what moves a run to a terminal status,
+                # and its real floor is 30 seconds. Shrink it along with the
+                # tail intervals, or this test waits out the floor.
+                scheduler_interval_min=0.05,
+                scheduler_interval_max=0.05,
             )
             daemons.append(daemon)
             daemon.run_forever(stop)
@@ -1326,3 +1337,580 @@ def test_a_daemon_cycle_creates_the_ssh_control_directory(
         "a real ssh would have failed to bind its control socket"
     )
     assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700
+
+
+# --------------------------------------------------------------------------
+# Two schedules: the tail and the scheduler poll
+# --------------------------------------------------------------------------
+#
+# The daemon reads event logs off the shared filesystem every couple of
+# seconds, and asks `squeue` what the jobs are doing at most every thirty.
+# Those are two different questions put to two different pieces of
+# infrastructure, and the whole point of splitting them is that the cheap one
+# can be fast without dragging the expensive one along with it.
+#
+# Everything below drives both schedules with a fake clock. Proving a
+# thirty-second floor by waiting thirty seconds would give us a test suite
+# nobody runs, and proving a five-minute ceiling by waiting five minutes would
+# give us one nobody can run.
+
+
+class FakeClock:
+    """A monotonic clock the test moves by hand.
+
+    `Daemon` takes its clock as a constructor argument for exactly this
+    reason: both schedules are elapsed-time decisions, so the only two ways to
+    test them are to sleep through them or to inject the clock. The fake reads
+    like the real thing -- a zero-argument callable returning seconds that only
+    ever goes forwards -- because that is the contract `time.monotonic`
+    satisfies and the daemon relies on.
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = float(now)
+
+    def advance(self, seconds: float) -> float:
+        self.now += float(seconds)
+        return self.now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_a_cycle_can_tail_without_polling_the_scheduler(store, backend, tmp_path):
+    """Metrics keep flowing on a cycle that asks slurmctld nothing.
+
+    This is the reason the two schedules exist. A user watching a loss curve
+    wants a new point every couple of seconds; slurmctld, which every person
+    on the cluster shares, wants to be asked about a job's state once every
+    thirty at most. Before the split, one interval served both and there was no
+    way to have the first without the second.
+    """
+    run_id, path = seed_run(store, tmp_path)
+    # The job has just started, so the first poll finds a change and leaves the
+    # interval at its floor rather than backing off.
+    backend.statuses["1001"] = "running"
+    backend.append(path, line(run_id, 1, "run_started"))
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    first = daemon.run_once()
+    assert first.tailed
+    assert first.scheduler_polled
+    assert len(backend.status_calls) == 1
+    assert first.scheduler_interval == pytest.approx(daemon_module.SCHEDULER_INTERVAL_MIN)
+
+    # Two seconds later: a tail's worth of time, nowhere near a poll's worth.
+    backend.append(path, metric_line(run_id, 2, 100, loss=0.5))
+    clock.advance(2)
+    second = daemon.run_once()
+
+    assert second.tailed
+    assert second.bytes_read > 0
+    assert second.scheduler_polled is False
+    assert len(backend.status_calls) == 1
+    assert store.count_metrics(run_id) == 1
+
+    # Thirty seconds after the poll, and only then, the scheduler is asked again.
+    clock.advance(28)
+    third = daemon.run_once()
+
+    assert third.scheduler_polled
+    assert len(backend.status_calls) == 2
+
+
+def test_the_scheduler_floor_holds_however_many_runs_are_active(store, backend, tmp_path):
+    """Twenty-five busy runs do not buy a single extra `squeue`.
+
+    How much the user's jobs are printing says nothing about how much load
+    slurmctld should be asked to carry, so run activity is deliberately absent
+    from `_scheduler_due`. Getting this wrong is not a small mistake: a daemon
+    polling at the tail's cadence for a twelve-hour run would put roughly
+    twenty thousand requests a day into shared infrastructure.
+    """
+    paths = {}
+    for n in range(25):
+        run_id, path = seed_run(store, tmp_path, f"vr_{n:02d}", job_id=str(n))
+        backend.statuses[str(n)] = "running"
+        backend.append(path, line(run_id, 1, "run_started"))
+        paths[run_id] = path
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    for cycle in range(10):
+        for n, (run_id, path) in enumerate(paths.items()):
+            # seq is per-run and monotonic; every run emits one point a cycle.
+            backend.append(path, metric_line(run_id, cycle + 2, cycle, loss=1.0 / (n + 1)))
+        stats = daemon.run_once()
+        assert stats.tailed
+        assert stats.bytes_read > 0
+        clock.advance(2)
+
+    # Ten cycles, twenty-five running runs, one question put to the scheduler.
+    assert len(backend.status_calls) == 1
+    assert sorted(backend.status_calls[0], key=int) == [str(n) for n in range(25)]
+    # And the tail did its job throughout: every run has ten points.
+    assert all(store.count_metrics(run_id) == 10 for run_id in paths)
+
+    # Past the floor, one more -- still exactly one, not twenty-five.
+    clock.advance(11)
+    daemon.run_once()
+    assert len(backend.status_calls) == 2
+
+
+def test_the_scheduler_interval_backs_off_to_the_ceiling(store, backend, tmp_path):
+    """Nothing changing means asking less often, up to five minutes and no further.
+
+    Twenty minutes into a twelve-hour run that nobody has touched, the answer
+    to "what is this job doing" has been the same for twenty minutes and will
+    be the same for hours. The backoff is what turns that observation into
+    fewer requests; the ceiling is what stops it turning into a daemon that
+    notices a finished job ten minutes late.
+    """
+    seed_run(store, tmp_path)
+    backend.statuses["1001"] = "queued"  # nothing ever changes
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    seen = []
+    for _ in range(7):
+        stats = daemon.run_once()
+        assert stats.scheduler_polled
+        assert stats.status_changes == 0
+        seen.append(stats.scheduler_interval)
+        # Sleep exactly as long as the daemon just decided to, so the next
+        # cycle is due to the millisecond -- the schedule tests itself.
+        clock.advance(daemon._scheduler_interval)
+
+    # 30 x 1.5 each time, then held at the ceiling.
+    assert seen == pytest.approx([45.0, 67.5, 101.25, 151.875, 227.8125, 300.0, 300.0])
+    assert daemon.scheduler_interval_max == 300.0
+
+
+def test_a_status_change_snaps_the_interval_back_to_the_floor(store, backend, tmp_path):
+    """The moment anything moves, pay attention again.
+
+    A job starting, finishing, being preempted or being cancelled all arrive as
+    a status change, and any of them means the picture is moving. Staying at a
+    five-minute poll through the interesting part of a run would be the worst
+    of both worlds: we backed off because nothing was happening, and now
+    something is.
+    """
+    run_id, _ = seed_run(store, tmp_path)
+    backend.statuses["1001"] = "queued"
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    for _ in range(3):
+        stats = daemon.run_once()
+        clock.advance(stats.scheduler_interval)
+    assert daemon._scheduler_interval == pytest.approx(101.25)
+
+    backend.statuses["1001"] = "running"  # the job started
+    stats = daemon.run_once()
+
+    assert stats.scheduler_polled
+    assert stats.status_changes == 1
+    assert stats.scheduler_interval == pytest.approx(30.0)
+    assert store.get_run(run_id)["status"] == "running"
+
+
+def test_a_poke_polls_at_once_and_resets_the_backoff(store, backend, tmp_path):
+    """`submit` and `cancel` say "look now", and the daemon looks now.
+
+    Those are the two moments a user has just done something and is watching
+    for the result -- and they are also, by construction, the moments the
+    backoff is at its most relaxed, because nothing had been happening, which
+    is why it backed off. Waiting out five minutes to show a job you just
+    submitted would make relay feel broken.
+
+    The interval afterwards is exactly the floor, even though the poll itself
+    found nothing new. A poke counts as a change for the backoff, the same as
+    a status change would: the user has just told us something is about to
+    move, and taking a "nothing changed" step up in the very same cycle would
+    mean the next poll comes at 45 seconds instead of 30.
+    """
+    seed_run(store, tmp_path)
+    backend.statuses["1001"] = "queued"
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    for _ in range(3):
+        stats = daemon.run_once()
+        clock.advance(stats.scheduler_interval)
+    assert daemon._scheduler_interval == pytest.approx(101.25)
+    calls_before = len(backend.status_calls)
+
+    store.poke_scheduler()  # what `relay submit` does, from another process
+    poked = daemon.run_once()  # no clock advance at all
+
+    assert poked.scheduler_polled is True
+    assert poked.scheduler_poked is True
+    assert len(backend.status_calls) == calls_before + 1
+    assert poked.scheduler_interval == pytest.approx(30.0)
+
+    # The poke is one-shot: it is a timestamp the daemon compares against the
+    # last one it acted on, so reading it again is not another poke.
+    again = daemon.run_once()
+    assert again.scheduler_polled is False
+    assert len(backend.status_calls) == calls_before + 1
+
+
+def test_a_daemon_started_after_a_poke_does_not_treat_it_as_news(store, backend, tmp_path):
+    """An hour-old `relay submit` must not poke a daemon that has just started.
+
+    The poke is a persistent timestamp rather than a flag that gets cleared, so
+    a new daemon has to seed itself with whatever is already there. Otherwise
+    every restart would find an ancient poke, treat it as fresh, and poll a
+    second time for no reason -- and on a busy laptop, restart-loop its way
+    into exactly the polling rate the floor exists to prevent.
+    """
+    seed_run(store, tmp_path)
+    backend.statuses["1001"] = "queued"
+    store.poke_scheduler()
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    # Cycle one polls regardless -- a daemon that has just started should look
+    # immediately rather than make the user wait out an interval.
+    first = daemon.run_once()
+    assert first.scheduler_polled
+
+    second = daemon.run_once()  # no advance, and no new poke
+    assert second.scheduler_polled is False
+    assert len(backend.status_calls) == 1
+
+
+def test_a_failed_poll_neither_grows_nor_resets_the_interval(store, backend, tmp_path):
+    """A network blip is not evidence about how fast the jobs are moving.
+
+    Growing the interval would punish the user for a dropped connection by
+    making recovery slower; resetting it would reward them for one. Neither
+    reading is supported by a call that never got an answer, so the interval is
+    left exactly where it was and the whole-cycle backoff handles a transport
+    that is genuinely down.
+    """
+    seed_run(store, tmp_path)
+    backend.statuses["1001"] = "queued"
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    first = daemon.run_once()
+    assert first.scheduler_interval == pytest.approx(45.0)
+
+    backend.status_error = ConnectionError("squeue: connection closed by remote host")
+    clock.advance(45)
+    failed = daemon.run_once()
+
+    assert failed.scheduler_polled
+    assert failed.status_failed
+    assert failed.scheduler_interval == pytest.approx(45.0)
+    assert daemon._scheduler_interval == pytest.approx(45.0)
+
+    backend.status_error = None
+    clock.advance(45)
+    recovered = daemon.run_once()
+
+    # Not reset to the floor (nothing changed), not stuck (the poll worked).
+    assert not recovered.status_failed
+    assert recovered.scheduler_interval == pytest.approx(67.5)
+
+
+def test_the_sleep_is_the_sooner_of_the_two_schedules(store, backend, tmp_path):
+    """One thread, two schedules, so the nap is however long the nearer one is.
+
+    A second thread for the scheduler poll would be the sophisticated
+    alternative, and it would also mean two things writing to one SQLite
+    connection. Instead the loop sleeps until whichever schedule comes first
+    and the next cycle works out which one it woke up for.
+    """
+    run_id, path = seed_run(store, tmp_path)
+    backend.statuses["1001"] = "running"
+    backend.append(path, line(run_id, 1, "run_started"))
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    stats = daemon.run_once()
+    assert stats.running == 1
+    # A running run makes the tail the nearer of the two, by a long way.
+    assert daemon._interval_for(stats) == INTERVAL_ACTIVE == 2.0
+
+    clock.advance(29)
+    stats = daemon.run_once()
+
+    assert stats.scheduler_polled is False
+    # One second of the scheduler's thirty is left, which is now sooner than
+    # the tail's two. Sleeping the full two would overshoot the poll.
+    assert daemon._interval_for(stats) == pytest.approx(1.0)
+
+
+def test_an_idle_daemon_still_wakes_up_for_the_scheduler(store, backend):
+    """Nothing to tail is not nothing to do.
+
+    With no runs at all the tail would happily sleep a minute, but a job may be
+    sitting in the queue about to start, and the only way to find out is to
+    ask. The scheduler's own schedule is what gets the daemon out of bed.
+    """
+    clock = FakeClock()
+    daemon = Daemon(
+        store,
+        backend,
+        # A ceiling equal to the floor means a fixed 30s poll with no backoff,
+        # which keeps this test about the `min` and not about the backoff.
+        scheduler_interval_min=30.0,
+        scheduler_interval_max=30.0,
+        clock=clock,
+    )
+
+    stats = daemon.run_once()
+
+    assert stats.runs_checked == 0
+    assert next_interval(stats) == INTERVAL_IDLE == 60.0
+    assert daemon._interval_for(stats) == pytest.approx(30.0)
+
+
+def test_the_scheduler_freshness_stamp_moves_only_when_the_scheduler_answers(
+    store, backend, tmp_path
+):
+    """Two schedules need two "last synced" numbers, or one of them lies.
+
+    `relay ls` prints both: how fresh the metrics are and how fresh the job
+    state is. They are minutes apart by design, and stamping the scheduler's
+    number on a cycle that only tailed would tell the user their job state was
+    two seconds old when it was five minutes old. Stale data is fine; stale
+    data presented as current is the one thing relay refuses to do.
+    """
+    run_id, path = seed_run(store, tmp_path)
+    backend.statuses["1001"] = "running"
+    backend.append(path, line(run_id, 1, "run_started"))
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)
+
+    assert store.last_scheduler_synced() is None
+
+    daemon.run_once()
+    stamped = store.last_scheduler_synced()
+    assert stamped is not None
+
+    backend.append(path, metric_line(run_id, 2, 10, loss=1.0))
+    clock.advance(2)
+    tail_only = daemon.run_once()
+
+    assert tail_only.scheduler_polled is False
+    assert tail_only.bytes_read > 0
+    # The tail's stamp is fresh; the scheduler's has not moved.
+    assert store.last_synced() is not None
+    assert store.last_scheduler_synced() == stamped
+
+
+def test_a_failed_poll_does_not_stamp_the_scheduler_freshness(store, backend, tmp_path):
+    """Asking and getting nothing is not the same as the scheduler answering."""
+    seed_run(store, tmp_path)
+    backend.status_error = ConnectionError("squeue: unreachable")
+
+    stats = Daemon(store, backend, clock=FakeClock()).run_once()
+
+    assert stats.scheduler_polled
+    assert stats.status_failed
+    assert store.last_scheduler_synced() is None
+
+
+def test_a_cycle_that_asks_nothing_mid_outage_is_neither_success_nor_failure(
+    store, backend
+):
+    """A cycle that made no call learned nothing, so it must not clear the streak.
+
+    This case only exists because the schedules are independent. Before the
+    split every cycle made at least one call, so "did not fail" really did mean
+    "something worked". Now a cycle can have nothing to tail (a queued run with
+    no run directory yet) and no poll due, and if that counted as a success it
+    would reset the backoff in the middle of an outage and put a fresh
+    "metrics 0s ago" under `relay ls` on the strength of having done nothing.
+    """
+    # No run_dir, so there is nothing to tail: the scheduler poll is the only
+    # call this daemon can make, and it is the one that is broken.
+    store.create_run("vr_x", backend="fake", job_id="7", status="queued")
+    backend.status_error = ConnectionError("ssh: Operation timed out")
+
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock)  # the real 30s floor
+
+    first = daemon.run_once()
+    assert first.failed
+    assert first.scheduler_polled
+    assert daemon.consecutive_failures == 1
+    assert store.last_synced() is None
+
+    # Same instant: the poll is not due, and there is nothing else to do.
+    neutral = daemon.run_once()
+
+    assert neutral.scheduler_polled is False
+    assert neutral.read_attempts == 0
+    assert not neutral.failed
+    assert daemon.consecutive_failures == 1
+    assert store.last_synced() is None
+
+    clock.advance(30)
+    third = daemon.run_once()
+
+    # The streak kept counting rather than starting over, so the whole-cycle
+    # backoff is where an outage of this length should have put it.
+    assert third.failed
+    assert daemon.consecutive_failures == 2
+    assert next_interval(third) == 8.0
+
+
+def test_a_cycle_that_asks_nothing_does_not_claim_the_channel_is_healthy(store, backend):
+    """The neutral-cycle rule covers the daemon_state row too, not just the streak.
+
+    `run_once` already refuses to let a cycle that made no call reset the
+    failure streak or stamp `last_synced`. But `_record_cycle_health` runs
+    afterwards on the same cycle and, seeing no error *this* cycle, clears the
+    stored `unreachable` verdict and writes a fresh `last_ok_ts` -- which is
+    supposed to mean "the last time the channel demonstrably worked". Nothing
+    was demonstrated. `relay ls` and the dashboard read those fields, so during
+    an outage the error banner blinks off on every in-between cycle and comes
+    back on the next real attempt.
+    """
+    store.create_run("vr_x", backend="fake", job_id="7", status="queued")
+    backend.status_error = ConnectionError("ssh: Operation timed out")
+
+    daemon = Daemon(store, backend, clock=FakeClock())
+    daemon.run_once()
+    assert store.get_daemon_state()["last_error_kind"] == "unreachable"
+
+    neutral = daemon.run_once()
+    assert neutral.read_attempts == 0 and not neutral.scheduler_polled
+
+    state = store.get_daemon_state()
+    assert state["last_error_kind"] == "unreachable"
+    assert state["last_ok_ts"] is None
+
+
+# --------------------------------------------------------------------------
+# Merging the intervals: the config file and `relay daemon`'s flags
+# --------------------------------------------------------------------------
+
+
+DAEMON_INTERVAL_KEYS = {
+    "interval_active",
+    "interval_queued",
+    "interval_idle",
+    "scheduler_interval_min",
+    "scheduler_interval_max",
+    "usage_interval_seconds",
+}
+
+
+def a_config(**daemon_fields) -> config_module.Config:
+    return config_module.Config(daemon=config_module.DaemonConfig(**daemon_fields))
+
+
+def test_daemon_intervals_reads_the_config_when_no_flags_were_given():
+    """The `daemon:` section reaches the daemon under the daemon's own names.
+
+    Two vocabularies meet here: the config file says `tail_interval_active`
+    and `usage_interval`, `Daemon.__init__` says `interval_active` and
+    `usage_interval_seconds`. The translation has to live in exactly one place
+    or the two drift apart silently -- a renamed key that nothing reads looks
+    identical to a key that works.
+    """
+    conf = a_config(
+        tail_interval_active=5,
+        scheduler_interval_min=45,
+        scheduler_interval_max=90,
+        usage_interval=120,
+    )
+
+    values = daemon_module.daemon_intervals(conf, None)
+
+    assert values["interval_active"] == 5
+    assert values["scheduler_interval_min"] == 45
+    assert values["scheduler_interval_max"] == 90
+    assert values["usage_interval_seconds"] == 120
+    # Untouched keys keep the config's defaults rather than disappearing.
+    assert values["interval_queued"] == 30.0
+    assert values["interval_idle"] == 60.0
+
+
+def test_a_flag_beats_the_file_and_an_absent_flag_changes_nothing():
+    """argparse leaves an unpassed flag as None, and None must mean "not given".
+
+    If a None went through as a value it would overwrite the config with
+    nothing, so a user who passed one flag would silently lose every other
+    setting in their `daemon:` section.
+    """
+    conf = a_config(tail_interval_active=5, scheduler_interval_min=45)
+
+    values = daemon_module.daemon_intervals(
+        conf, {"scheduler_interval_min": 60, "interval_active": None}
+    )
+
+    assert values["scheduler_interval_min"] == 60
+    assert values["interval_active"] == 5
+
+
+def test_the_scheduler_floor_is_reapplied_to_the_flag(caplog):
+    """`--scheduler-interval-min 3` is clamped, not obeyed.
+
+    The flag never goes through the config validator, and a floor enforced in
+    one of the two places a number can arrive from is not a floor. The warning
+    has to name the flag, because that is what the user has to go and change.
+    """
+    conf = a_config(scheduler_interval_min=45, scheduler_interval_max=90)
+
+    with caplog.at_level(logging.WARNING, logger="relay.config"):
+        values = daemon_module.daemon_intervals(conf, {"scheduler_interval_min": 3})
+
+    assert values["scheduler_interval_min"] == config_module.MIN_SCHEDULER_INTERVAL == 10.0
+    assert "floor" in caplog.text
+    assert "--scheduler-interval-min" in caplog.text
+
+
+def test_a_flag_that_pushes_the_floor_above_the_ceiling_raises_the_ceiling(caplog):
+    """`--scheduler-interval-min 120` against a config ceiling of 90 still starts.
+
+    A ceiling under the floor would make the backoff shrink the interval
+    instead of growing it. The config validator rejects that combination
+    outright, but a flag can still produce it, and refusing to start the daemon
+    -- leaving the user with no view of their running jobs at all -- would be a
+    poor trade for a number we can simply raise.
+    """
+    conf = a_config(scheduler_interval_min=45, scheduler_interval_max=90)
+
+    with caplog.at_level(logging.WARNING, logger="relay.daemon"):
+        values = daemon_module.daemon_intervals(conf, {"scheduler_interval_min": 120})
+
+    assert values["scheduler_interval_min"] == 120
+    assert values["scheduler_interval_max"] == 120
+    assert "scheduler_interval_max" in caplog.text
+
+
+def test_daemon_intervals_returns_exactly_the_daemon_kwargs(store, backend):
+    """The dict is passed to `Daemon(**...)`, so a stray key is a TypeError at startup.
+
+    `relay daemon` builds its daemon from whatever this returns. A key that is
+    not a constructor argument would not be caught by anything until the moment
+    a user runs the command, which is the worst possible place to find out.
+    """
+    values = daemon_module.daemon_intervals(a_config(), None)
+
+    assert set(values) == DAEMON_INTERVAL_KEYS
+    accepted = set(inspect.signature(Daemon.__init__).parameters)
+    assert DAEMON_INTERVAL_KEYS <= accepted
+
+    daemon = Daemon(store, backend, **values)
+
+    assert daemon.interval_active == 2.0
+    assert daemon.scheduler_interval_min == 30.0
+    assert daemon.scheduler_interval_max == 300.0
+    assert daemon.usage_interval_seconds == 300.0

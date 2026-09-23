@@ -1,7 +1,7 @@
 # relay
 
 An experiment orchestrator for Slurm clusters. Submit training jobs
-from your laptop, watch live metrics, and have jobs survive preemption. Uses with
+from your laptop, watch live metrics, and have jobs survive preemption, with
 no tracking server, no cloud account, and no inbound network connection to the
 cluster.
 
@@ -18,6 +18,49 @@ shared filesystem, so that is the entire channel:
 
 No component calls another component's functions. The only shared contracts
 are the event log format and the database schema.
+
+## What relay runs on the login node
+
+Relay reaches the cluster from your laptop over a single SSH connection. This
+is everything it runs there:
+
+| Command | How often | What it touches |
+| --- | --- | --- |
+| `tail -c +N <run>/events.jsonl`, one per active run | every 2s while a run is producing output, 30s while everything is queued, 60s when nothing is active | shared filesystem |
+| `squeue --me`, one call covering every run | no more often than every 30s, backing off to 5 minutes while nothing changes | slurmctld |
+| `sacct -j <ids>`, one call covering every run | every 5 minutes, plus one final reading when a run finishes, then never again for it | Slurm accounting |
+| `mkdir` and `tar -x`, then `sbatch` | two round trips, once per `relay submit` | shared filesystem, then slurmctld |
+| one idle SSH control socket | held open, `ControlPersist=8h` | sshd |
+| `command -v sbatch`, `sacctmgr`, `scontrol show partition`, `df` | only when you run `relay doctor` | shared filesystem and slurmctld |
+
+Every command relay runs there goes through `ssh -T ... bash --noprofile --norc
+-c '...'`, so it is one shell per call and your `~/.bashrc` is skipped. None of
+it is CPU-heavy: the sidecar and your training script run on the compute node,
+not here.
+
+The two schedules are deliberately separate. Tailing an event log is a
+filesystem read that scales with how much your job has printed, so it can run
+every two seconds without anyone noticing. `squeue` is a question put to
+slurmctld, one process serving every user on the cluster, so relay holds it to
+at least `scheduler_interval_min` (default 30 seconds) no matter how busy your
+runs are. After each poll in which no job changed state it multiplies the
+interval by 1.5, up to `scheduler_interval_max` (default 300 seconds); any
+state change snaps it straight back to the minimum, and `relay submit` and
+`relay cancel` reset it too, so a job you just submitted or cancelled is
+noticed promptly. There is a hard floor of 10 seconds: configure anything below
+it and relay clamps it up and says so.
+
+Six optional keys in a `daemon:` section of the config tune all of this, all in
+seconds: `tail_interval_active`, `tail_interval_queued`, `tail_interval_idle`,
+`scheduler_interval_min`, `scheduler_interval_max`, `usage_interval`. `relay
+daemon` takes the same six as flags — `--tail-interval-active`,
+`--tail-interval-queued`, `--tail-interval-idle`, `--scheduler-interval-min`,
+`--scheduler-interval-max`, `--usage-interval` — and a flag beats the file.
+
+Because the two schedules run independently, `relay ls`, `relay usage` and the
+dashboard end with two ages rather than one — `metrics 2s ago · job state 41s
+ago` — so job state that is minutes old reads as the design working rather than
+as a daemon that has stopped.
 
 ## Install
 

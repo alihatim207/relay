@@ -34,6 +34,7 @@ problem (round-trip YAML) we do not need to have.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ from pathlib import Path
 import yaml
 
 from relay import ssh
+
+log = logging.getLogger("relay.config")
 
 # --------------------------------------------------------------------------
 # SSH timing
@@ -251,6 +254,45 @@ class ResumeConfig:
 
 
 @dataclass(frozen=True)
+class DaemonConfig:
+    """The `daemon:` section. How often the syncing loop touches the cluster.
+
+    Two schedules, not one, because the daemon asks two very different things
+    of two very different pieces of shared infrastructure:
+
+      the **tail** reads new bytes out of each run's `events.jsonl` on the
+      shared filesystem. It is a `tail -c +N` on GPFS. It is cheap, it scales
+      with how much the job is printing rather than with how often we ask, and
+      nobody else on the cluster notices it. This is the one that can run every
+      two seconds, and it is what makes the dashboard feel live.
+
+      the **scheduler poll** asks `squeue` what the jobs are doing. That
+      question goes to slurmctld, a single process serving the entire cluster.
+      Most HPC sites ask users not to poll it more often than about every
+      thirty seconds, and an unattended daemon polling every two seconds for a
+      twelve-hour run would make roughly twenty thousand requests nobody asked
+      for.
+
+    So the tail keeps the old adaptive 2/30/60 second schedule and the
+    scheduler poll gets a floor of thirty seconds that no run state can talk it
+    out of, plus a backoff that stretches towards `scheduler_interval_max`
+    while nothing is changing. Job state is *slow-moving* data: a queued job
+    that starts at 14:03 is no less started for being noticed at 14:03:28.
+
+    `usage_interval` is the `sacct` accounting fetch, which is the most
+    expensive question relay asks and the least urgent -- nobody watches
+    GPU-hours tick up the way they watch a loss curve.
+    """
+
+    tail_interval_active: float = 2.0
+    tail_interval_queued: float = 30.0
+    tail_interval_idle: float = 60.0
+    scheduler_interval_min: float = 30.0
+    scheduler_interval_max: float = 300.0
+    usage_interval: float = 300.0
+
+
+@dataclass(frozen=True)
 class Config:
     """A parsed, validated config file."""
 
@@ -331,6 +373,11 @@ class Config:
     cost: CostConfig = field(default_factory=CostConfig)
     resume: ResumeConfig = field(default_factory=ResumeConfig)
 
+    # How often the daemon polls the filesystem and the scheduler. Its own
+    # section because the two schedules inside it answer to different costs;
+    # see DaemonConfig.
+    daemon: DaemonConfig = field(default_factory=DaemonConfig)
+
     def __post_init__(self) -> None:
         # The default depends on the environment at load time, which a
         # dataclass default cannot express. Empty string means "not given".
@@ -356,6 +403,16 @@ REQUEUE_ON_TERM = ("auto", "always", "never")
 # having an effect. A setting that does nothing is worse than an error.
 MIN_PREEMPT_GRACE = 3
 
+# The absolute floor on how often relay will ask slurmctld anything, whatever
+# the config says. Not a default -- a *limit*. The default is 30 and that is
+# the number to leave alone; this is here so that a user who edits the number
+# downwards in a hurry cannot accidentally point a 1-second polling loop at
+# infrastructure the whole cluster depends on. A configured value below this is
+# clamped up to it with a warning rather than rejected, because refusing to
+# start the daemon over a polling interval would be a worse outcome than
+# quietly being a good citizen.
+MIN_SCHEDULER_INTERVAL = 10.0
+
 _TOP_LEVEL_KEYS = frozenset(
     {
         "backend",
@@ -370,6 +427,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "slurm",
         "cost",
         "resume",
+        "daemon",
     }
 )
 _SLURM_KEYS = frozenset(
@@ -377,6 +435,16 @@ _SLURM_KEYS = frozenset(
 )
 _COST_KEYS = frozenset({"gpu_hour_rate"})
 _RESUME_KEYS = frozenset({"checkpoint_glob", "arg"})
+_DAEMON_KEYS = frozenset(
+    {
+        "tail_interval_active",
+        "tail_interval_queued",
+        "tail_interval_idle",
+        "scheduler_interval_min",
+        "scheduler_interval_max",
+        "usage_interval",
+    }
+)
 
 # What `resume.arg` must contain, so relay has somewhere to put the checkpoint
 # it found. A literal, not a format language: relay replaces exactly this
@@ -708,6 +776,129 @@ def _validate_resume_section(raw: object) -> ResumeConfig:
     return ResumeConfig(checkpoint_glob=checkpoint_glob, arg=arg)
 
 
+def _positive_seconds(raw: dict, key: str, where: str, default: float) -> float:
+    """One interval out of a `daemon:` block, as a positive number of seconds.
+
+    Floats are accepted here, unlike `ssh_timeout` and `preempt_grace`, which
+    insist on whole seconds. Those two are budgets measured against a real
+    cluster's behaviour, where a fractional value means the user has
+    misunderstood what the number is. These are polling intervals: 0.5 is a
+    perfectly coherent thing to ask for in a test, and the code that consumes
+    them is doing float arithmetic on a monotonic clock anyway.
+
+    `bool` is rejected before `int` for the usual reason -- `isinstance(True,
+    int)` is True, so `tail_interval_active: yes` would otherwise become a
+    one-second poll.
+    """
+    value = raw.get(key, default)
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"{where} '{key}' must be a number of seconds, but it is {value!r} in "
+            f"{config_path()}. The default is {default:g}."
+        )
+    if value <= 0:
+        raise ConfigError(
+            f"{where} '{key}' is {value!r} in {config_path()}, but a polling "
+            f"interval has to be a positive number of seconds. A zero or "
+            f"negative interval would mean a loop with no sleep in it. The "
+            f"default is {default:g}."
+        )
+    return float(value)
+
+
+def _validate_daemon_section(raw: object) -> DaemonConfig:
+    """Validate the `daemon:` section, which is entirely optional.
+
+    The defaults in `DaemonConfig` are the values relay ships with, and most
+    users should never write this section at all. It exists for two kinds of
+    people: someone on a cluster whose admins have asked for gentler polling
+    than thirty seconds, and someone debugging who wants the dashboard to
+    update faster than the tail's two.
+    """
+    if raw is None:
+        return DaemonConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"The 'daemon' section of {config_path()} must be a block of settings, "
+            f"but it is {type(raw).__name__}. It holds polling intervals in "
+            f"seconds; see the comments in that file for the expected shape."
+        )
+
+    message = _unknown_keys_message(raw, _DAEMON_KEYS, "daemon")
+    if message:
+        raise ConfigError(message)
+
+    defaults = DaemonConfig()
+    tail_active = _positive_seconds(
+        raw, "tail_interval_active", "daemon", defaults.tail_interval_active
+    )
+    tail_queued = _positive_seconds(
+        raw, "tail_interval_queued", "daemon", defaults.tail_interval_queued
+    )
+    tail_idle = _positive_seconds(
+        raw, "tail_interval_idle", "daemon", defaults.tail_interval_idle
+    )
+    sched_min = _positive_seconds(
+        raw, "scheduler_interval_min", "daemon", defaults.scheduler_interval_min
+    )
+    sched_max = _positive_seconds(
+        raw, "scheduler_interval_max", "daemon", defaults.scheduler_interval_max
+    )
+    usage = _positive_seconds(raw, "usage_interval", "daemon", defaults.usage_interval)
+
+    sched_min = clamp_scheduler_interval(sched_min, source=str(config_path()))
+
+    if sched_max < sched_min:
+        raise ConfigError(
+            f"daemon 'scheduler_interval_max' is {sched_max:g} in {config_path()}, "
+            f"which is below 'scheduler_interval_min' ({sched_min:g}). The maximum "
+            f"is the ceiling the poll backs off *towards* while nothing is "
+            f"changing, so it cannot be smaller than the interval it starts at. "
+            f"Either raise the maximum or lower the minimum."
+        )
+
+    return DaemonConfig(
+        tail_interval_active=tail_active,
+        tail_interval_queued=tail_queued,
+        tail_interval_idle=tail_idle,
+        scheduler_interval_min=sched_min,
+        scheduler_interval_max=sched_max,
+        usage_interval=usage,
+    )
+
+
+def clamp_scheduler_interval(value: float, *, source: str) -> float:
+    """Hold `value` at or above `MIN_SCHEDULER_INTERVAL`, warning if it was under.
+
+    Its own public function because the same clamp has to apply to two inputs
+    that arrive by different routes -- the config file and `relay daemon
+    --scheduler-interval-min` -- and a limit enforced in one of two places is
+    not a limit. `source` names whichever one it was, so the warning tells the
+    user which number to go and edit.
+
+    A warning and a clamp rather than an error, because the cost of being
+    wrong in each direction is not symmetric: refusing to start the daemon
+    means the user sees nothing at all about their running jobs, while clamping
+    means they see everything, slightly later than they asked.
+    """
+    if value >= MIN_SCHEDULER_INTERVAL:
+        return value
+    log.warning(
+        "scheduler poll interval of %gs from %s is below relay's %gs floor; "
+        "using %gs instead. `squeue` asks slurmctld, which every user on the "
+        "cluster shares, and most sites ask for no more than one poll every "
+        "30 seconds. Relay tails your event logs on its own faster schedule, "
+        "so metrics stay live regardless of this number.",
+        value,
+        source,
+        MIN_SCHEDULER_INTERVAL,
+        MIN_SCHEDULER_INTERVAL,
+    )
+    return MIN_SCHEDULER_INTERVAL
+
+
 # --------------------------------------------------------------------------
 # load
 # --------------------------------------------------------------------------
@@ -852,6 +1043,7 @@ def load(path: Path | None = None) -> Config:
     slurm = _validate_slurm_section(raw.get("slurm"))
     cost = _validate_cost_section(raw.get("cost"))
     resume = _validate_resume_section(raw.get("resume"))
+    daemon = _validate_daemon_section(raw.get("daemon"))
 
     if remote_root is not None and not remote_root.startswith(("/", "~")):
         raise ConfigError(
@@ -898,6 +1090,7 @@ def load(path: Path | None = None) -> Config:
         slurm=slurm,
         cost=cost,
         resume=resume,
+        daemon=daemon,
     )
 
 
@@ -1022,6 +1215,49 @@ backend: local
 # never invent a price for you.
 # cost:
 #   gpu_hour_rate: 1.25
+
+
+# ---------------------------------------------------------------------------
+# Daemon polling. Optional; the defaults are the right answer for most people.
+# ---------------------------------------------------------------------------
+
+# The daemon does two different jobs on two different schedules, because they
+# cost two different things.
+#
+# The TAIL reads new bytes out of each run's events.jsonl on the shared
+# filesystem. It is cheap, it bothers nobody else on the cluster, and it is
+# what makes metrics show up live. It follows the state of your runs: fast
+# while something is producing output, slower while everything is queued,
+# slowest when there is nothing to watch.
+#
+# The SCHEDULER POLL asks `squeue` what your jobs are doing. That question
+# goes to slurmctld, a single process serving every user on the cluster, so
+# relay holds it to at least scheduler_interval_min no matter what your runs
+# are doing - and stretches towards scheduler_interval_max, multiplying by 1.5
+# each time, while no job changes state. It snaps back to the minimum the
+# moment anything moves, and `relay submit` and `relay cancel` reset it too,
+# so a job you just submitted is noticed promptly.
+#
+# Job state is slow-moving data. A job that starts at 14:03:00 is no less
+# started for being noticed at 14:03:28, and your metrics are live regardless
+# because they come from the tail.
+#
+# relay will not poll the scheduler more often than every 10 seconds whatever
+# you put here; a smaller number is clamped with a warning.
+#
+# usage_interval is the `sacct` accounting fetch: the most expensive question
+# relay asks and the least urgent. Relay also takes one final reading the
+# moment a run finishes, whatever this is set to.
+#
+# `relay daemon` takes the same six values as flags (--tail-interval-active,
+# --scheduler-interval-min and so on), and a flag beats this file.
+# daemon:
+#   tail_interval_active: 2
+#   tail_interval_queued: 30
+#   tail_interval_idle: 60
+#   scheduler_interval_min: 30
+#   scheduler_interval_max: 300
+#   usage_interval: 300
 
 
 # ---------------------------------------------------------------------------

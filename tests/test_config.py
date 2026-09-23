@@ -9,6 +9,7 @@ some trial and error to get right.
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from pathlib import Path
 
@@ -1125,6 +1126,349 @@ def test_starter_config_documents_resume():
     # The per-run overrides, so the user knows they are not stuck with this.
     assert "--checkpoint-glob" in text
     assert "--resume-arg" in text
+
+
+# --------------------------------------------------------------------------
+# load: the daemon section
+# --------------------------------------------------------------------------
+#
+# Six polling intervals, all seconds, all optional. The interesting one is
+# `scheduler_interval_min`, which is the only number in relay's config that is
+# silently corrected rather than accepted or rejected: `squeue` asks slurmctld,
+# which every user on the cluster shares, so relay holds itself to a floor no
+# config file can talk it below.
+
+
+def test_daemon_section_defaults_when_absent():
+    """No `daemon:` section is the normal case, and it must cost nothing.
+
+    Almost nobody should ever write this section. If the defaults here and the
+    ones in DaemonConfig ever drift apart, a user who never touched the file
+    would get different polling from a user who pasted the commented-out block
+    back in unchanged.
+    """
+    write_config("backend: local\n")
+    conf = cfg.load()
+
+    assert conf.daemon == cfg.DaemonConfig()
+    assert conf.daemon.tail_interval_active == 2.0
+    assert conf.daemon.tail_interval_queued == 30.0
+    assert conf.daemon.tail_interval_idle == 60.0
+    assert conf.daemon.scheduler_interval_min == 30.0
+    assert conf.daemon.scheduler_interval_max == 300.0
+    assert conf.daemon.usage_interval == 300.0
+    # Floats, not ints: everything downstream does arithmetic on a monotonic
+    # clock, and a stray int here would be the one value that behaves
+    # differently under division.
+    for name in cfg._DAEMON_KEYS:
+        assert isinstance(getattr(conf.daemon, name), float)
+
+
+def test_daemon_section_accepts_every_key():
+    """A whole section written out in the obvious way: plain integers.
+
+    YAML hands these over as ints; relay stores floats, so the values have to
+    survive the conversion rather than being rejected for having the wrong
+    type.
+    """
+    write_config(
+        """\
+        daemon:
+          tail_interval_active: 1
+          tail_interval_queued: 15
+          tail_interval_idle: 45
+          scheduler_interval_min: 20
+          scheduler_interval_max: 200
+          usage_interval: 600
+        """
+    )
+    daemon = cfg.load().daemon
+
+    assert daemon == cfg.DaemonConfig(
+        tail_interval_active=1.0,
+        tail_interval_queued=15.0,
+        tail_interval_idle=45.0,
+        scheduler_interval_min=20.0,
+        scheduler_interval_max=200.0,
+        usage_interval=600.0,
+    )
+    for name in cfg._DAEMON_KEYS:
+        assert isinstance(getattr(daemon, name), float)
+
+
+def test_daemon_accepts_a_fractional_interval():
+    """Unlike ssh_timeout and preempt_grace, these take floats.
+
+    Those two are budgets measured against a real cluster, where a fraction
+    means the user has misunderstood the number. A polling interval is not:
+    half a second is a coherent thing to ask for while watching a run, and the
+    tests themselves want sub-second intervals to finish quickly.
+    """
+    write_config("daemon:\n  tail_interval_active: 0.5\n")
+    assert cfg.load().daemon.tail_interval_active == 0.5
+
+
+def test_daemon_partial_section_keeps_the_other_defaults():
+    """Setting one interval must not reset the five you did not mention."""
+    write_config("daemon:\n  usage_interval: 900\n")
+    daemon = cfg.load().daemon
+
+    assert daemon.usage_interval == 900.0
+    assert daemon.tail_interval_active == 2.0
+    assert daemon.tail_interval_queued == 30.0
+    assert daemon.tail_interval_idle == 60.0
+    assert daemon.scheduler_interval_min == 30.0
+    assert daemon.scheduler_interval_max == 300.0
+
+
+def test_unknown_daemon_key_raises():
+    """A plausible-sounding key that relay ignores is worse than an error.
+
+    `poll:` reads like it ought to work. Silently dropping it would leave the
+    user believing they had slowed relay down when they had not.
+    """
+    write_config("daemon:\n  poll: 5\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "poll" in message
+    assert "daemon" in message
+    # And the keys that do exist, or the user has nowhere to go.
+    assert "tail_interval_active" in message
+
+
+def test_daemon_interval_rejects_a_boolean():
+    """`tail_interval_active: yes` is YAML for True, and True is an int.
+
+    isinstance(True, int) is True in Python, so a naive number check would turn
+    this into a one-second poll - the single most aggressive setting available,
+    arrived at by writing something that looks like it means "on".
+    """
+    write_config("daemon:\n  tail_interval_active: yes\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "tail_interval_active" in message
+    assert "number of seconds" in message
+
+
+def test_daemon_interval_rejects_a_string():
+    """Seconds are a bare number here; relay parses no duration suffixes."""
+    write_config('daemon:\n  tail_interval_active: "2s"\n')
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    assert "tail_interval_active" in str(exc.value)
+
+
+def test_daemon_interval_rejects_zero():
+    """Zero is a loop with no sleep in it, which is a busy wait, not a setting."""
+    write_config("daemon:\n  tail_interval_idle: 0\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "tail_interval_idle" in message
+    assert "positive" in message
+
+
+def test_daemon_interval_rejects_a_negative_number():
+    write_config("daemon:\n  usage_interval: -5\n")
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "usage_interval" in message
+    assert "positive" in message
+
+
+def test_scheduler_interval_min_below_the_floor_is_clamped_with_a_warning(caplog):
+    """Too-fast scheduler polling is corrected, not refused.
+
+    Every other bad number in this file is an error. This one is not, and the
+    asymmetry is deliberate: refusing to start means the user sees nothing at
+    all about their running jobs, while clamping means they see everything a
+    few seconds later than they asked. The warning has to name the floor and
+    the file, because the point is that the user goes and edits the number.
+    """
+    caplog.set_level(logging.WARNING, logger="relay.config")
+    write_config("daemon:\n  scheduler_interval_min: 5\n")
+
+    conf = cfg.load()
+    assert conf.daemon.scheduler_interval_min == 10.0
+    assert conf.daemon.scheduler_interval_min == cfg.MIN_SCHEDULER_INTERVAL
+
+    records = [r for r in caplog.records if r.name == "relay.config"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert records[0].levelno == logging.WARNING
+    assert "10" in message
+    assert "floor" in message
+    assert str(cfg.config_path()) in message
+    # And why there is a floor at all, so the clamp does not read as arbitrary.
+    assert "slurmctld" in message
+
+
+def test_scheduler_interval_min_at_the_floor_does_not_warn(caplog):
+    """Exactly at the floor is a legitimate setting, not a near miss."""
+    caplog.set_level(logging.WARNING, logger="relay.config")
+    write_config("daemon:\n  scheduler_interval_min: 10\n")
+
+    assert cfg.load().daemon.scheduler_interval_min == 10.0
+    assert [r for r in caplog.records if r.name == "relay.config"] == []
+
+
+def test_scheduler_interval_max_below_min_raises():
+    """A ceiling below the floor it backs off from is incoherent.
+
+    The max is where the poll stretches *towards* while nothing changes, so a
+    max under the min describes a backoff that goes backwards. Unlike the
+    floor, this one cannot be silently fixed - relay does not know which of the
+    two numbers the user meant.
+    """
+    write_config(
+        """\
+        daemon:
+          scheduler_interval_min: 30
+          scheduler_interval_max: 20
+        """
+    )
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "scheduler_interval_max" in message
+    assert "scheduler_interval_min" in message
+
+
+def test_scheduler_max_is_compared_against_the_clamped_min(caplog):
+    """The clamp happens first, so it can be what pushes the min above the max.
+
+    Written on its own, `min: 5, max: 8` looks consistent: 8 is comfortably
+    above 5. But the min is clamped up to 10 before the two are compared, so
+    the pair becomes 10 and 8 and the comparison fails. That ordering is worth
+    pinning down, because the alternative - compare first, clamp after - would
+    accept this file and leave the daemon with a max below its own min.
+    """
+    caplog.set_level(logging.WARNING, logger="relay.config")
+    write_config(
+        """\
+        daemon:
+          scheduler_interval_min: 5
+          scheduler_interval_max: 8
+        """
+    )
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "scheduler_interval_max" in message
+    # The message quotes the clamped minimum (10), not the 5 in the file, so
+    # the user can see what the comparison was actually made against.
+    assert "10" in message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "daemon:\n  - 1\n  - 2\n",  # a list
+        "daemon: fast\n",  # a bare string
+    ],
+)
+def test_daemon_section_must_be_a_mapping(text):
+    """`daemon: fast` is the shape a hurried user reaches for first."""
+    write_config(text)
+    with pytest.raises(cfg.ConfigError) as exc:
+        cfg.load()
+    message = str(exc.value)
+    assert "daemon" in message
+    assert "block of settings" in message
+
+
+def test_null_daemon_section_is_allowed():
+    """`daemon:` with nothing under it parses as None.
+
+    That means "not given", exactly as it does for the slurm, cost and resume
+    sections. A user who comments out every line but the heading has not
+    written an error.
+    """
+    write_config("daemon:\n")
+    assert cfg.load().daemon == cfg.DaemonConfig()
+
+
+def test_daemon_is_an_accepted_top_level_key():
+    """A file holding nothing but a daemon section is a complete config."""
+    write_config("daemon:\n  tail_interval_active: 3\n")
+    conf = cfg.load()
+    assert conf.backend == "local"
+    assert conf.daemon.tail_interval_active == 3.0
+    assert "daemon" in cfg._TOP_LEVEL_KEYS
+
+
+def test_daemon_config_is_frozen():
+    write_config("")
+    daemon = cfg.load().daemon
+    with pytest.raises(Exception):
+        daemon.tail_interval_active = 0.1  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
+# clamp_scheduler_interval, on its own
+# --------------------------------------------------------------------------
+#
+# Public and called from two places - config.load() and `relay daemon`'s
+# flags - because a limit enforced on one of two routes in is not a limit.
+
+
+def test_clamp_leaves_an_acceptable_interval_alone(caplog):
+    caplog.set_level(logging.WARNING, logger="relay.config")
+    assert cfg.clamp_scheduler_interval(30.0, source="x") == 30.0
+    assert [r for r in caplog.records if r.name == "relay.config"] == []
+
+
+def test_clamp_names_its_source_in_the_warning(caplog):
+    """The warning has to say which number to go and change.
+
+    The same clamp catches a config key and a command-line flag, and telling
+    someone who typed `--scheduler-interval-min 1` to go and edit their config
+    file would send them to the wrong place.
+    """
+    caplog.set_level(logging.WARNING, logger="relay.config")
+    assert cfg.clamp_scheduler_interval(1, source="--flag") == 10.0
+
+    records = [r for r in caplog.records if r.name == "relay.config"]
+    assert len(records) == 1
+    assert "--flag" in records[0].getMessage()
+
+
+def test_clamp_returns_the_floor_itself_unchanged(caplog):
+    caplog.set_level(logging.WARNING, logger="relay.config")
+    assert cfg.clamp_scheduler_interval(
+        cfg.MIN_SCHEDULER_INTERVAL, source="x"
+    ) == cfg.MIN_SCHEDULER_INTERVAL
+    assert [r for r in caplog.records if r.name == "relay.config"] == []
+
+
+# --------------------------------------------------------------------------
+# init: the daemon block in the starter file
+# --------------------------------------------------------------------------
+
+
+def test_starter_config_documents_the_daemon_section():
+    """The starter file is where a user learns this section exists at all.
+
+    Every key commented out, so that the file's contents and this module's
+    defaults cannot drift: an omitted key is a default key.
+    """
+    text = cfg.STARTER_CONFIG
+    assert "# daemon:" in text
+    for key in sorted(cfg._DAEMON_KEYS):
+        assert f"#   {key}:" in text
+    # The two things a user cannot guess: that the floor exists, and that
+    # metrics stay live regardless because they come from the tail.
+    assert "10 seconds" in text
+    assert "clamped" in text
+
+
+def test_starter_config_daemon_block_loads_as_defaults():
+    """Init, then load: the commented block must leave every default in place."""
+    cfg.init()
+    assert cfg.load().daemon == cfg.DaemonConfig()
 
 
 # --------------------------------------------------------------------------
