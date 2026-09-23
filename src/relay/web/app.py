@@ -194,6 +194,9 @@ def create_app(
             "last_synced_age_seconds": _age_seconds(last_synced),
             "last_scheduler": last_scheduler,
             "last_scheduler_age_seconds": _age_seconds(last_scheduler),
+            # Zero means the daemon is idle and both ages above are local
+            # bookkeeping, not cluster freshness; the page says so instead.
+            "active_runs": len(store.list_runs(active_only=True)),
         }
 
     @app.get("/api/runs/{run_id}")
@@ -226,6 +229,7 @@ def create_app(
         run["last_synced_age_seconds"] = _age_seconds(last_synced)
         run["last_scheduler"] = last_scheduler
         run["last_scheduler_age_seconds"] = _age_seconds(last_scheduler)
+        run["active_runs"] = len(store.list_runs(active_only=True))
         return run
 
     @app.get("/api/runs/{run_id}/metrics/{name}")
@@ -325,6 +329,9 @@ def create_app(
             "last_synced_age_seconds": _age_seconds(last_synced),
             "last_scheduler": last_scheduler,
             "last_scheduler_age_seconds": _age_seconds(last_scheduler),
+            # Zero means the daemon is idle and both ages above are local
+            # bookkeeping, not cluster freshness; the page says so instead.
+            "active_runs": len(store.list_runs(active_only=True)),
         }
 
         # The `cost` key exists only when someone told relay what an hour

@@ -923,6 +923,43 @@ def test_sync_line_keeps_the_old_sentence_when_nothing_has_synced_at_all():
     assert line == "last synced never — is `relay daemon` running?"
 
 
+def test_sync_line_says_idle_when_there_are_no_active_runs():
+    """With nothing to watch, two fresh ages would read as polling for nothing.
+
+    An idle daemon makes no cluster calls at all -- no `squeue`, no `sacct`,
+    no event-log reads -- and only cycles locally. But "metrics 3s ago · job
+    state 3s ago" under an empty table looks exactly like a daemon hammering
+    the cluster on a schedule, which is what a user assumed on seeing it. One
+    honest line instead: nothing active, and the daemon is alive.
+    """
+    line = cli._sync_line(
+        {
+            "active_runs": 0,
+            "last_synced": "2026-09-18T12:00:00.000Z",
+            "last_synced_age_s": 3.0,
+            # Hours old, and correctly so: nothing has been asked since the
+            # last run finished. Not shown, because it would look alarming.
+            "last_scheduler": "2026-09-18T09:00:00.000Z",
+            "last_scheduler_age_s": 10800.0,
+        }
+    )
+    assert line == "no active runs · daemon alive 3s ago"
+
+
+def test_sync_line_never_synced_outranks_idle():
+    """A daemon that never ran is a different problem from one with no work."""
+    line = cli._sync_line({"active_runs": 0, "last_synced": None})
+    assert line == "last synced never — is `relay daemon` running?"
+
+
+def test_sync_footer_counts_active_runs(monkeypatch):
+    with Store(cfg.db_path()) as store:
+        assert cli._sync_footer(store)["active_runs"] == 0
+        store.create_run("vr_a", backend="local", job_id="1", status="running")
+        store.create_run("vr_b", backend="local", job_id="2", status="completed")
+        assert cli._sync_footer(store)["active_runs"] == 1
+
+
 def test_sync_footer_carries_both_clocks(monkeypatch):
     with Store(cfg.db_path()) as store:
         store.mark_synced("2026-09-18T12:00:00.000Z")

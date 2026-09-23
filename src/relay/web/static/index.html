@@ -409,7 +409,7 @@ function renderBanner(state) {
   }
 }
 
-function renderSync(metricsAge, schedulerAge) {
+function renderSync(metricsAge, schedulerAge, activeRuns) {
   // Always say how old the data is. Stale data the user knows is stale is
   // fine; stale data presented as current is not.
   //
@@ -425,6 +425,13 @@ function renderSync(metricsAge, schedulerAge) {
     $('sync').textContent = 'daemon has not synced yet';
     return;
   }
+  if (activeRuns === 0) {
+    // Nothing to tail, nothing to ask the scheduler about: the daemon is
+    // cycling locally and the cluster sees no traffic at all. Two ages here
+    // would look like polling for nothing, which is the one thing it is not.
+    $('sync').textContent = 'no active runs · daemon alive ' + age(metricsAge);
+    return;
+  }
   const scheduler = (schedulerAge === null || schedulerAge === undefined)
     ? 'job state never polled'
     : 'job state ' + age(schedulerAge);
@@ -437,7 +444,7 @@ function renderSync(metricsAge, schedulerAge) {
 
 async function refreshList() {
   const data = await getJSON('/api/runs');
-  renderSync(data.last_synced_age_seconds, data.last_scheduler_age_seconds);
+  renderSync(data.last_synced_age_seconds, data.last_scheduler_age_seconds, data.active_runs);
   // Daemon health rides in the runs envelope rather than having an endpoint
   // of its own: this poll already runs every two seconds.
   renderBanner(data.daemon_state);
@@ -640,7 +647,7 @@ async function refreshDetail() {
   const run = await getJSON('/api/runs/' + encodeURIComponent(runId));
   if (currentRun !== runId) return;  // user navigated away mid-request
 
-  renderSync(run.last_synced_age_seconds, run.last_scheduler_age_seconds);
+  renderSync(run.last_synced_age_seconds, run.last_scheduler_age_seconds, run.active_runs);
   $('detail-status').textContent = run.status + (run.stale ? ' (stale)' : '');
   $('detail-status').className = 'status status-' + run.status + (run.stale ? ' stale' : '');
   $('detail-meta').textContent =

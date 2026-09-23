@@ -1660,29 +1660,52 @@ def test_the_sleep_is_the_sooner_of_the_two_schedules(store, backend, tmp_path):
     assert daemon._interval_for(stats) == pytest.approx(1.0)
 
 
-def test_an_idle_daemon_still_wakes_up_for_the_scheduler(store, backend):
-    """Nothing to tail is not nothing to do.
+def test_an_idle_daemon_has_no_scheduler_schedule(store, backend, tmp_path):
+    """No active runs means nothing to ask, so the scheduler sits this out.
 
-    With no runs at all the tail would happily sleep a minute, but a job may be
-    sitting in the queue about to start, and the only way to find out is to
-    ask. The scheduler's own schedule is what gets the daemon out of bed.
+    An earlier version treated the scheduler's timer as always live: with no
+    runs the first cycle "polled" (a no-op, since there were no job IDs),
+    stamped job state as fresh, and then its backoff remainders drove the
+    sleep -- the daemon woke at 60, 30, 60, 60, 15 seconds to do nothing.
+    The user saw two fresh ages on the dashboard and reasonably asked
+    whether relay was polling the cluster for nothing.
+
+    It never was -- an idle daemon makes zero cluster calls either way -- but
+    now it also does not pretend to: no poll, no "job state" stamp, and the
+    tail's idle interval alone decides the sleep. The first run to appear is
+    polled immediately, because `_last_scheduler_poll` was never set.
     """
     clock = FakeClock()
-    daemon = Daemon(
-        store,
-        backend,
-        # A ceiling equal to the floor means a fixed 30s poll with no backoff,
-        # which keeps this test about the `min` and not about the backoff.
-        scheduler_interval_min=30.0,
-        scheduler_interval_max=30.0,
-        clock=clock,
-    )
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
 
+    sleeps = []
+    for _ in range(5):
+        stats = daemon.run_once()
+        assert stats.runs_checked == 0
+        assert stats.jobs_to_poll == 0
+        assert stats.scheduler_polled is False
+        sleeps.append(daemon._interval_for(stats))
+        clock.advance(sleeps[-1])
+
+    assert sleeps == [INTERVAL_IDLE] * 5
+    assert backend.status_calls == []
+    assert store.last_scheduler_synced() is None
+    # Alive, though: the tail stamp still moves, which is what `relay ls`
+    # turns into "no active runs · daemon alive Ns ago".
+    assert store.last_synced() is not None
+    assert daemon._last_scheduler_poll is None
+
+    # A run appears (what `relay submit` does from another process). The very
+    # next cycle polls, without waiting out any interval.
+    seed_run(store, tmp_path, "vr_new", job_id="42", status="queued")
+    backend.statuses["42"] = "running"
     stats = daemon.run_once()
 
-    assert stats.runs_checked == 0
-    assert next_interval(stats) == INTERVAL_IDLE == 60.0
-    assert daemon._interval_for(stats) == pytest.approx(30.0)
+    assert stats.jobs_to_poll == 1
+    assert stats.scheduler_polled is True
+    assert backend.status_calls == [["42"]]
+    assert stats.status_changes == 1
+    assert store.last_scheduler_synced() is not None
 
 
 def test_the_scheduler_freshness_stamp_moves_only_when_the_scheduler_answers(

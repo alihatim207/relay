@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import math
 import logging
 import os
 import signal
@@ -187,6 +188,11 @@ class CycleStats:
     # ask" look identical from the outside and mean opposite things.
     tailed: bool = False
     scheduler_polled: bool = False
+    # How many active runs had a job ID to ask the scheduler about. Zero means
+    # there was nothing to poll, which is different from "not due yet": with
+    # nothing to ask, the scheduler schedule does not exist this cycle, so it
+    # neither fires nor decides how long the daemon sleeps.
+    jobs_to_poll: int = 0
     # True when this cycle's poll was triggered by `store.poke_scheduler()`
     # (what `relay submit` and `relay cancel` do) rather than by the clock.
     scheduler_poked: bool = False
@@ -520,6 +526,7 @@ class Daemon:
         # them is due; on a live run that is usually the tail alone, because
         # the tail runs every two seconds and the scheduler poll is held to
         # thirty or more.
+        stats.jobs_to_poll = sum(1 for run in runs if run.get("job_id"))
         poll_scheduler = self._scheduler_due(runs, stats)
         # The tail has no separate gate: `run_forever` sleeps until the sooner
         # of the two schedules, so if we woke up and the scheduler was not the
@@ -980,11 +987,17 @@ class Daemon:
             relaxed precisely because nothing had been happening.
           * the interval has elapsed.
 
-        A run with no job ID is not a reason to poll, but it is also not a
-        reason *not* to: `_batched_status` filters those out on its own and
-        returns without a call if nothing is left, so a cycle whose only runs
-        are unsubmitted costs nothing either way.
+        And one way to get a no that beats all three: there is no job to ask
+        about. An idle daemon -- no active runs, or none with a job ID yet --
+        has no scheduler schedule at all. It does not poll, it does not stamp
+        "job state" as fresh (nothing was asked, so nothing is known), and its
+        backoff timer does not drive the sleep; the tail's idle interval does.
+        `_last_scheduler_poll` is left as it was, so the first run to appear
+        gets polled immediately, and a poke that arrived while idle is left
+        unconsumed for the same reason.
         """
+        if stats.jobs_to_poll == 0:
+            return False
         if self._poked():
             # Recorded on the stats so `_advance_scheduler_backoff` treats it
             # as a change: a poke means the picture is about to move, so the
@@ -1220,9 +1233,9 @@ class Daemon:
         else:
             tail = self.interval_idle
 
-        return min(tail, self._scheduler_sleep())
+        return min(tail, self._scheduler_sleep(stats))
 
-    def _scheduler_sleep(self) -> float:
+    def _scheduler_sleep(self, stats: CycleStats) -> float:
         """Seconds until the scheduler poll is next due, floored at zero.
 
         Zero is a real answer, not an error: it means the poll is already
@@ -1230,7 +1243,13 @@ class Daemon:
         left of the scheduler interval. `_interval_for` takes a `min` with the
         tail interval, so a zero here simply means the next cycle happens as
         soon as this one finishes -- and that cycle will poll.
+
+        Infinity is the other real answer: nothing to poll, so no deadline.
+        Without it an idle daemon woke at 60, 30, 60, 60, 15 seconds -- the
+        backoff timer's remainders -- to do nothing each time.
         """
+        if stats.jobs_to_poll == 0:
+            return math.inf
         if self._last_scheduler_poll is None:
             return 0.0
         remaining = self._scheduler_interval - (self._now() - self._last_scheduler_poll)

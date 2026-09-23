@@ -94,6 +94,7 @@ def test_runs_list_shape(client):
         # tests at the bottom of this file.
         "last_scheduler",
         "last_scheduler_age_seconds",
+        "active_runs",
     }
     assert body["last_synced"] is not None
     # The daemon synced a moment ago, so the age is a small non-negative number.
@@ -608,9 +609,31 @@ def test_scheduler_freshness_moves_without_the_metrics_clock(unsynced_client):
 def test_page_shows_both_ages_in_one_line(client):
     """The header says which number belongs to which clock, in plain words."""
     page = client.get("/").text
-    assert "function renderSync(metricsAge, schedulerAge)" in page
+    assert "function renderSync(metricsAge, schedulerAge, activeRuns)" in page
     assert "'metrics '" in page
     assert "job state never polled" in page
     # Both call sites pass the scheduler age through.
-    assert "renderSync(data.last_synced_age_seconds, data.last_scheduler_age_seconds)" in page
-    assert "renderSync(run.last_synced_age_seconds, run.last_scheduler_age_seconds)" in page
+    assert "renderSync(data.last_synced_age_seconds, data.last_scheduler_age_seconds, data.active_runs)" in page
+    assert "renderSync(run.last_synced_age_seconds, run.last_scheduler_age_seconds, run.active_runs)" in page
+    assert "no active runs · daemon alive" in page
+
+
+def test_active_runs_counts_only_non_terminal_runs(client, db_path):
+    """`active_runs` is what lets the page say "no active runs" honestly.
+
+    Zero tells the page that neither age is cluster freshness -- the daemon is
+    cycling locally and making no cluster calls at all -- so it shows one
+    "daemon alive" age instead of two that look like polling for nothing. A
+    completed run must not count: a user whose last job finished an hour ago
+    is idle, not watching.
+    """
+    body = client.get("/api/runs").json()
+    assert isinstance(body["active_runs"], int)
+    active = sum(1 for run in body["runs"] if run["status"] not in ("completed", "failed", "cancelled"))
+    assert body["active_runs"] == active
+
+    with Store(db_path) as store:
+        for run_id in [run["run_id"] for run in body["runs"]]:
+            store.update_run_status(run_id, "completed")
+    assert client.get("/api/runs").json()["active_runs"] == 0
+    assert client.get("/api/usage").json()["active_runs"] == 0

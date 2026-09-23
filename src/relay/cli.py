@@ -292,6 +292,12 @@ def _sync_line(data: dict) -> str:
     if data.get("last_synced") is None:
         return "last synced never — is `relay daemon` running?"
     metrics = _format_age(data.get("last_synced_age_s"))
+    if data.get("active_runs") == 0:
+        # Nothing to tail and nothing to ask the scheduler about, so neither
+        # age means anything: the daemon is cycling locally and touching the
+        # cluster not at all. Two fresh-looking ages here read as "relay is
+        # polling for nothing", which is exactly what it is not doing.
+        return f"no active runs · daemon alive {metrics} ago"
     if data.get("last_scheduler") is None:
         # The daemon is running and tailing, but has not managed a scheduler
         # poll yet: a fresh daemon on its first cycle, or one whose `squeue`
@@ -317,6 +323,10 @@ def _sync_footer(store: Store) -> dict:
     last_synced = store.last_synced()
     last_scheduler = store.last_scheduler_synced()
     return {
+        # How many runs the daemon is actually watching. Zero changes what the
+        # two ages below mean -- see `_sync_line` -- and a script can use it
+        # to tell "idle" from "stalled" without parsing the human line.
+        "active_runs": len(store.list_runs(active_only=True)),
         "last_synced": last_synced,
         "last_synced_age_s": _age_seconds(last_synced),
         # The scheduler poll's own clock. Legitimately much older than the one
