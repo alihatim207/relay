@@ -149,6 +149,90 @@ itself and come back. Cancel through relay, or use `requeue_on_term: auto`
 (the default), which resolves to `never` on any partition whose `PreemptMode`
 already includes `REQUEUE`, including Klone's.
 
+## Using relay from Claude Code
+
+relay is a plain CLI with no daemon-side API, which makes it easy for a
+coding agent to drive. Every read command takes `--json`, every command exits
+with a meaningful code, and errors go to stderr as one sentence saying what
+happened and what to do next. Claude Code can submit runs, watch them, read
+logs, and report GPU-hours without any integration beyond having `relay` on
+`PATH`.
+
+### One-time setup, done by you
+
+Two steps need a human and cannot be done by an agent:
+
+```sh
+relay connect   # opens the SSH master; answers Duo once
+relay daemon    # leave this running in its own terminal tab
+```
+
+`relay connect` waits for a Duo push, so an agent that runs it will sit until
+the timeout. The daemon is what moves events from the cluster into the local
+database; with it stopped, `relay ls` still works but shows stale data and
+says so.
+
+### Tell Claude Code how to use it
+
+Put this in the `CLAUDE.md` of the repo that holds your training scripts,
+adjusting the paths:
+
+```markdown
+## Submitting jobs with relay
+
+Training runs go to the Slurm cluster through the `relay` CLI. Config is in
+~/.config/relay/config.yaml and already sets the account, partition, time
+limit, GPU, and the conda environment; do not pass those flags.
+
+- Submit: `relay submit /abs/path/to/train.py -- --script-args here`
+  Everything after `--` reaches the script. Use `--seeds 0-4` for a sweep,
+  `--time HH:MM:SS` to override the wall clock, `--name` to label the run.
+- Watch: `relay ls --json`, `relay show <run_id> --json`,
+  `relay logs <run_id>` (never `--follow`, it blocks).
+- Metrics: the script must print `##relay## {"step": N, "loss": ...}`
+  with `flush=True`; anything else it prints is a log line.
+- Cost: `relay usage --json`.
+- Stop: `relay cancel <run_id>`. Ask before cancelling anything.
+- Never run `relay connect`, `relay daemon`, `relay dash`, or `relay attach`;
+  they are interactive or long-running and I run them myself.
+- Exit codes: 0 ok, 1 runtime failure, 2 bad usage, 3 not configured,
+  4 cannot reach the cluster (tell me to run `relay connect`), 5 no such run.
+- Job state in `relay ls` is polled from Slurm no more than once a minute
+  and backs off to five minutes while nothing changes. Do not loop on
+  `relay ls` waiting for a job to start; check once, report, and move on.
+```
+
+### Permissions
+
+In that repo's `.claude/settings.json`, let the read-only commands run without
+a prompt and keep the ones that spend cluster time or stop a job behind one:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(relay ls*)",
+      "Bash(relay show*)",
+      "Bash(relay logs*)",
+      "Bash(relay usage*)",
+      "Bash(relay doctor*)"
+    ],
+    "ask": [
+      "Bash(relay submit*)",
+      "Bash(relay cancel*)"
+    ]
+  }
+}
+```
+
+### What a session looks like
+
+Claude Code edits the training script, runs `relay submit ... -- --lr 3e-4`,
+reads back the run ID, and a few minutes later checks `relay show <run_id>
+--json` for the latest step and metrics. If a run fails, `relay logs <run_id>`
+has the traceback. If the cluster is unreachable, the exit code is 4 and the
+message says to run `relay connect`, which is your cue, not the agent's.
+
 ## What relay runs on the login node
 
 Relay reaches the cluster from your laptop over a single SSH connection. This
