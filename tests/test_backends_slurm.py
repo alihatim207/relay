@@ -1343,7 +1343,7 @@ def test_parse_real_klone_output():
 
     rows = parse_sacct_usage(text)
 
-    assert [row.job_id for row in rows] == ["40268341", "40379788", "40381592"]
+    assert [row.job_id for row in rows] == ["40000001", "40000002", "40000003"]
     assert all(row.state == "COMPLETED" for row in rows)
     assert all(row.partition == "gpu-l40s" for row in rows)
     assert [row.gpus for row in rows] == [1, 1, 1]

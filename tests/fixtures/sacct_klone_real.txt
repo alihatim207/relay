@@ -1,6 +1,6 @@
-# REAL Klone output, captured 2026-09-21 on klone-login03 with:
-#   SLURM_TIME_FORMAT=%s sacct -j 40381592,40379788,40268341 -X --duplicates --noheader --parsable2 --format=JobIDRaw,State,Partition,Start,End,ElapsedRaw,AllocTRES
+# Klone output, captured 2026-09-21 on a login node with (job IDs replaced):
+#   SLURM_TIME_FORMAT=%s sacct -j 40000003,40000002,40000001 -X --duplicates --noheader --parsable2 --format=JobIDRaw,State,Partition,Start,End,ElapsedRaw,AllocTRES
 # Note the AllocTRES ordering: Klone prints the typed GPU key BEFORE the untyped one.
-40268341|COMPLETED|gpu-l40s|1789691379|1789693766|2387|billing=8,cpu=8,gres/gpu:l40s=1,gres/gpu=1,mem=64G,node=1
-40379788|COMPLETED|gpu-l40s|1789968096|1789968360|264|billing=8,cpu=8,gres/gpu:l40s=1,gres/gpu=1,mem=64G,node=1
-40381592|COMPLETED|gpu-l40s|1789975571|1789975603|32|billing=2,cpu=2,gres/gpu:l40s=1,gres/gpu=1,mem=8G,node=1
+40000001|COMPLETED|gpu-l40s|1789691379|1789693766|2387|billing=8,cpu=8,gres/gpu:l40s=1,gres/gpu=1,mem=64G,node=1
+40000002|COMPLETED|gpu-l40s|1789968096|1789968360|264|billing=8,cpu=8,gres/gpu:l40s=1,gres/gpu=1,mem=64G,node=1
+40000003|COMPLETED|gpu-l40s|1789975571|1789975603|32|billing=2,cpu=2,gres/gpu:l40s=1,gres/gpu=1,mem=8G,node=1
