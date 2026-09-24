@@ -282,10 +282,10 @@ def test_submit_copies_grace_and_slurm_fields_into_the_spec(tmp_path, fake_backe
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         remote_python: /sw/python/bin/python3
         slurm:
-          account: mlopt
+          account: yourgroup
           partition: gpu-a40
           grace_seconds: 90
           time: "04:00:00"
@@ -298,7 +298,7 @@ def test_submit_copies_grace_and_slurm_fields_into_the_spec(tmp_path, fake_backe
     # The backend honours the spec over its own defaults, so the grace period
     # has to be copied in or a per-cluster setting would silently do nothing.
     assert spec.grace_seconds == 90
-    assert spec.account == "mlopt"
+    assert spec.account == "yourgroup"
     assert spec.partition == "gpu-a40"
     assert spec.time_limit == "04:00:00"
     # Nothing was asked for, so nothing is carried: these are lists now, and an
@@ -306,7 +306,7 @@ def test_submit_copies_grace_and_slurm_fields_into_the_spec(tmp_path, fake_backe
     assert spec.sbatch_extra == []
     assert spec.setup == []
     # Remote paths are posix, and the remote interpreter comes from the config.
-    assert spec.run_dir.startswith("/mmfs1/gscratch/mlopt/you/relay/")
+    assert spec.run_dir.startswith("/mmfs1/gscratch/yourgroup/you/relay/")
     assert spec.command[0] == "/sw/python/bin/python3"
 
 
@@ -316,11 +316,11 @@ def test_submit_time_flag_and_signal_policy_reach_the_spec(fake_backend):
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         requeue_on_term: always
         preempt_grace: 20
         slurm:
-          account: mlopt
+          account: yourgroup
           partition: ckpt-all
           time: "02:00:00"
         """
@@ -348,7 +348,7 @@ def test_submit_falls_back_to_the_config_time(fake_backend):
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         slurm:
           time: "04:00:00"
         """
@@ -374,7 +374,7 @@ def test_submit_with_no_time_limit_anywhere_is_a_usage_error(capsys, fake_backen
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         """
     )
     fake_backend.submit_error = MissingTimeLimit(
@@ -534,7 +534,7 @@ def test_sbatch_extra_flag_replaces_the_config_list(fake_backend):
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         slurm:
           time: "04:00:00"
           sbatch_extra:
@@ -555,7 +555,7 @@ def test_config_sbatch_extra_is_used_when_the_flag_is_absent(fake_backend):
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         slurm:
           time: "04:00:00"
           sbatch_extra:
@@ -574,9 +574,9 @@ def test_gres_from_config_reaches_the_spec(fake_backend):
         """
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/you/relay
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
         slurm:
-          account: mlopt
+          account: yourgroup
           partition: ckpt-all
           time: "04:00:00"
           gres: gpu:a40:2
@@ -1181,11 +1181,11 @@ def test_cancel_hands_the_backend_the_run_directory(local_config, fake_backend):
     preemption's SIGTERM, so a cancelled run would come straight back under
     `requeue_on_term: always`.
     """
-    seed_run("vr", job_id="4242", run_dir="/mmfs1/gscratch/mlopt/you/relay/vr")
+    seed_run("vr", job_id="4242", run_dir="/mmfs1/gscratch/yourgroup/you/relay/vr")
 
     assert cli.main(["cancel", "vr"]) == cli.EXIT_OK
     assert fake_backend.cancel_calls == [
-        {"job_id": "4242", "run_dir": "/mmfs1/gscratch/mlopt/you/relay/vr"}
+        {"job_id": "4242", "run_dir": "/mmfs1/gscratch/yourgroup/you/relay/vr"}
     ]
 
 
@@ -1291,7 +1291,7 @@ def cli_ssh_persist() -> str:
 SLURM_CONFIG = """
     backend: slurm
     ssh_alias: klone
-    remote_root: /mmfs1/gscratch/mlopt/you/relay
+    remote_root: /mmfs1/gscratch/yourgroup/you/relay
     slurm:
       time: "04:00:00"
     """
@@ -1481,8 +1481,8 @@ def usage_db():
       crashed    1800s x 1 GPU, run status failed      = 0.5, all of it wasted
                                                   total = 6.0 GPU-hours
     """
-    seed_run("good", status="completed", job_id="1", spec={"account": "mlopt"})
-    seed_run("preempted", status="running", job_id="2", spec={"account": "mlopt"})
+    seed_run("good", status="completed", job_id="1", spec={"account": "yourgroup"})
+    seed_run("preempted", status="running", job_id="2", spec={"account": "yourgroup"})
     seed_run("crashed", status="failed", job_id="3", spec={"account": "other"})
 
     with Store(cfg.db_path()) as store:
@@ -1683,13 +1683,13 @@ def test_usage_by_partition_and_group_change_the_grouping(capsys, usage_db):
     assert cli.main(["usage", "--by", "group", "--json"]) == cli.EXIT_OK
     groups = json.loads(capsys.readouterr().out)
     # The account comes out of the spec relay stored at submit time.
-    assert {row["key"] for row in groups["rows"]} == {"mlopt", "other"}
+    assert {row["key"] for row in groups["rows"]} == {"yourgroup", "other"}
 
     # --group narrows to one account whatever the grouping is.
-    assert cli.main(["usage", "--group", "mlopt", "--json"]) == cli.EXIT_OK
-    mlopt = json.loads(capsys.readouterr().out)
-    assert {row["key"] for row in mlopt["rows"]} == {"good", "preempted"}
-    assert mlopt["totals"]["gpu_hours"] == pytest.approx(5.5)
+    assert cli.main(["usage", "--group", "yourgroup", "--json"]) == cli.EXIT_OK
+    yourgroup = json.loads(capsys.readouterr().out)
+    assert {row["key"] for row in yourgroup["rows"]} == {"good", "preempted"}
+    assert yourgroup["totals"]["gpu_hours"] == pytest.approx(5.5)
 
 
 def test_usage_since_is_forwarded_to_every_query(capsys, monkeypatch, usage_db):
@@ -1715,12 +1715,12 @@ def test_usage_since_is_forwarded_to_every_query(capsys, monkeypatch, usage_db):
     monkeypatch.setattr(Store, "wasted_hours", fake_wasted)
 
     code = cli.main(
-        ["usage", "--by", "partition", "--since", "2026-09-01", "--group", "mlopt", "--json"]
+        ["usage", "--by", "partition", "--since", "2026-09-01", "--group", "yourgroup", "--json"]
     )
     assert code == cli.EXIT_OK
-    assert seen["rows"] == ("partition", "2026-09-01", "mlopt")
-    assert seen["totals"] == ("2026-09-01", "mlopt")
-    assert seen["wasted"] == ("2026-09-01", "mlopt")
+    assert seen["rows"] == ("partition", "2026-09-01", "yourgroup")
+    assert seen["totals"] == ("2026-09-01", "yourgroup")
+    assert seen["wasted"] == ("2026-09-01", "yourgroup")
 
 
 def test_usage_rejects_a_date_it_cannot_read(capsys, usage_db):
@@ -1848,10 +1848,10 @@ def test_dash_serves_with_a_cancel_hook(capsys, monkeypatch, local_config, fake_
 
     # The injected hook is the same path `relay cancel` takes, run directory
     # and all -- the dashboard's Cancel button must not skip CANCEL_REQUESTED.
-    seed_run("vr", job_id="77", run_dir="/mmfs1/gscratch/mlopt/you/relay/vr")
+    seed_run("vr", job_id="77", run_dir="/mmfs1/gscratch/yourgroup/you/relay/vr")
     captured["cancel_fn"]("vr")
     assert fake_backend.cancel_calls == [
-        {"job_id": "77", "run_dir": "/mmfs1/gscratch/mlopt/you/relay/vr"}
+        {"job_id": "77", "run_dir": "/mmfs1/gscratch/yourgroup/you/relay/vr"}
     ]
     assert get_run("vr")["status"] == "cancelled"
 

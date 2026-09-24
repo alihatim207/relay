@@ -344,7 +344,7 @@ def test_null_slurm_section_is_allowed():
 
 
 def test_ssh_alias_with_at_sign_raises():
-    write_config("ssh_alias: ahatim@klone.hyak.uw.edu\n")
+    write_config("ssh_alias: you@klone.hyak.uw.edu\n")
     with pytest.raises(cfg.ConfigError) as exc:
         cfg.load()
     message = str(exc.value)
@@ -369,7 +369,7 @@ def test_plain_ssh_alias_is_accepted():
 
 
 def test_slurm_backend_without_ssh_alias_raises():
-    write_config("backend: slurm\nremote_root: /mmfs1/gscratch/mlopt/ahatim/relay\n")
+    write_config("backend: slurm\nremote_root: /mmfs1/gscratch/yourgroup/you/relay\n")
     with pytest.raises(cfg.ConfigError) as exc:
         cfg.load()
     assert "ssh_alias" in str(exc.value)
@@ -407,15 +407,15 @@ def test_full_slurm_config_loads():
         """\
         backend: slurm
         ssh_alias: klone
-        remote_root: /mmfs1/gscratch/mlopt/ahatim/relay
-        remote_python: /mmfs1/gscratch/mlopt/ahatim/venv/bin/python
+        remote_root: /mmfs1/gscratch/yourgroup/you/relay
+        remote_python: /mmfs1/gscratch/yourgroup/you/venv/bin/python
         requeue_on_term: never
         preempt_grace: 10
         setup:
           - module load cuda/12.4
           - conda activate rl
         slurm:
-          account: mlopt
+          account: yourgroup
           partition: ckpt-all
           time: "04:00:00"
           grace_seconds: 120
@@ -430,11 +430,11 @@ def test_full_slurm_config_loads():
     conf = cfg.load()
     assert conf.backend == "slurm"
     assert conf.ssh_alias == "klone"
-    assert conf.remote_root == "/mmfs1/gscratch/mlopt/ahatim/relay"
+    assert conf.remote_root == "/mmfs1/gscratch/yourgroup/you/relay"
     assert conf.remote_python.endswith("/venv/bin/python")
     assert conf.requeue_on_term == "never"
     assert conf.preempt_grace == 10
-    assert conf.slurm.account == "mlopt"
+    assert conf.slurm.account == "yourgroup"
     assert conf.slurm.partition == "ckpt-all"
     assert conf.slurm.time == "04:00:00"
     assert conf.slurm.grace_seconds == 120

@@ -733,8 +733,8 @@ def test_mark_usage_final_is_visible_on_the_run(store):
 @pytest.fixture
 def usage_fixture(store):
     """Two accounts, two partitions, several attempts. The shape of a report."""
-    store.create_run("a1", backend="slurm", job_id="1", spec={"account": "mlopt"})
-    store.create_run("a2", backend="slurm", job_id="2", spec={"account": "mlopt"})
+    store.create_run("a1", backend="slurm", job_id="1", spec={"account": "yourgroup"})
+    store.create_run("a2", backend="slurm", job_id="2", spec={"account": "yourgroup"})
     store.create_run("b1", backend="slurm", job_id="3", spec={"account": "other"})
     store.create_run("local", backend="local", job_id="999")  # no spec at all
 
@@ -744,7 +744,7 @@ def usage_fixture(store):
             usage_row(
                 job_id="2",
                 run_id="a2",
-                partition="gpu-mlopt",
+                partition="gpu-yourgroup",
                 start="2026-09-16T18:30:00.000Z",
                 elapsed_s=1800,
                 gpus=1,
@@ -775,9 +775,9 @@ def usage_fixture(store):
 
 def test_usage_by_group_reads_the_account_out_of_the_spec(usage_fixture):
     rows = {r["key"]: r for r in usage_fixture.usage_by("group")}
-    assert set(rows) == {"mlopt", "other", "(none)"}
-    assert rows["mlopt"]["gpu_hours"] == pytest.approx(2.0 + 0.5)
-    assert rows["mlopt"]["runs"] == 2
+    assert set(rows) == {"yourgroup", "other", "(none)"}
+    assert rows["yourgroup"]["gpu_hours"] == pytest.approx(2.0 + 0.5)
+    assert rows["yourgroup"]["runs"] == 2
     assert rows["other"]["gpu_hours"] == pytest.approx(8.0)
     # A run with no account is still hours somebody spent; it must not vanish.
     assert rows["(none)"]["cpu_hours"] == pytest.approx(2.0)
@@ -786,7 +786,7 @@ def test_usage_by_group_reads_the_account_out_of_the_spec(usage_fixture):
 def test_usage_by_partition_splits_ckpt_from_the_group_allocation(usage_fixture):
     rows = {r["key"]: r for r in usage_fixture.usage_by("partition")}
     assert rows["ckpt-all"]["gpu_hours"] == pytest.approx(2.0 + 8.0)
-    assert rows["gpu-mlopt"]["gpu_hours"] == pytest.approx(0.5)
+    assert rows["gpu-yourgroup"]["gpu_hours"] == pytest.approx(0.5)
     assert rows["(none)"]["gpu_hours"] == pytest.approx(0.0)
 
 
@@ -796,9 +796,9 @@ def test_usage_by_orders_biggest_first(usage_fixture):
 
 
 def test_group_filter_applies_to_every_grouping(usage_fixture):
-    rows = usage_fixture.usage_by("run", group="mlopt")
+    rows = usage_fixture.usage_by("run", group="yourgroup")
     assert {r["key"] for r in rows} == {"a1", "a2"}
-    assert usage_fixture.usage_totals(group="mlopt")["gpu_hours"] == pytest.approx(2.5)
+    assert usage_fixture.usage_totals(group="yourgroup")["gpu_hours"] == pytest.approx(2.5)
 
 
 def test_usage_totals_include_the_partition_split(usage_fixture):
@@ -810,7 +810,7 @@ def test_usage_totals_include_the_partition_split(usage_fixture):
 
     split = {p["partition"]: p["gpu_hours"] for p in totals["by_partition"]}
     assert split["ckpt-all"] == pytest.approx(10.0)
-    assert split["gpu-mlopt"] == pytest.approx(0.5)
+    assert split["gpu-yourgroup"] == pytest.approx(0.5)
     assert sum(split.values()) == pytest.approx(totals["gpu_hours"])
 
 
@@ -939,7 +939,7 @@ def test_completed_attempts_are_not_wasted(run):
 
 
 def test_wasted_hours_respects_since_and_group(store):
-    store.create_run("r", backend="slurm", job_id="1", status="failed", spec={"account": "mlopt"})
+    store.create_run("r", backend="slurm", job_id="1", status="failed", spec={"account": "yourgroup"})
     store.upsert_usage(
         [
             usage_row(job_id="1", run_id="r", start="2026-09-01T00:00:00.000Z", elapsed_s=3600),
@@ -948,7 +948,7 @@ def test_wasted_hours_respects_since_and_group(store):
     )
     assert store.wasted_hours()["failed"]["gpu_hours"] == pytest.approx(2.0)
     assert store.wasted_hours(since="2026-09-10")["failed"]["gpu_hours"] == pytest.approx(1.0)
-    assert store.wasted_hours(group="mlopt")["failed"]["runs"] == ["r"]
+    assert store.wasted_hours(group="yourgroup")["failed"]["runs"] == ["r"]
     assert store.wasted_hours(group="nobody")["failed"]["runs"] == []
 
 

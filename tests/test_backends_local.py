@@ -599,7 +599,7 @@ def test_slurm_fields_are_ignored_rather_than_rejected(tmp_path, caplog):
     backend = make_backend(tmp_path)
     script = write_script(tmp_path / "train.py", GOOD_SCRIPT)
     spec = make_spec(tmp_path, script, run_id="vr_slurmfields")
-    spec.account = "mlopt"
+    spec.account = "yourgroup"
     spec.partition = "gpu-a40"
     spec.sbatch_extra = ["--mem=64G"]
     spec.gres = "gpu:1"

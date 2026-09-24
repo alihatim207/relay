@@ -284,7 +284,7 @@ def test_daemon_state_error_is_reflected(client, db_path):
 # The fixture below is the whole point of these tests, so the arithmetic is
 # spelled out once here and the assertions just check it:
 #
-#   vr_u1  account mlopt, partition ckpt-all, status failed, 2 GPUs, 8 CPUs
+#   vr_u1  account yourgroup, partition ckpt-all, status failed, 2 GPUs, 8 CPUs
 #     attempt 1  PREEMPTED  3600s, checkpoint 900s before the end
 #     attempt 2  FAILED     1800s
 #   vr_u2  account other, partition gpu-a40, status completed, 1 GPU, 4 CPUs
@@ -310,7 +310,7 @@ def usage_db(tmp_path):
             name="preempted-then-crashed",
             job_id="1001",
             status="failed",
-            spec={"account": "mlopt", "partition": "ckpt-all"},
+            spec={"account": "yourgroup", "partition": "ckpt-all"},
         )
         store.create_run(
             USAGE_RUN_B,
@@ -436,7 +436,7 @@ def test_usage_by_partition(usage_client):
 def test_usage_by_group(usage_client):
     body = usage_client.get("/api/usage", params={"by": "group"}).json()
     rows = {row["key"]: row["gpu_hours"] for row in body["rows"]}
-    assert rows["mlopt"] == pytest.approx(3.0)
+    assert rows["yourgroup"] == pytest.approx(3.0)
     assert rows["other"] == pytest.approx(0.5)
 
 
@@ -452,7 +452,7 @@ def test_usage_since_filters_by_attempt_start(usage_client):
 
 
 def test_usage_group_filter_narrows_everything(usage_client):
-    body = usage_client.get("/api/usage", params={"group": "mlopt"}).json()
+    body = usage_client.get("/api/usage", params={"group": "yourgroup"}).json()
     assert [row["key"] for row in body["rows"]] == [USAGE_RUN_A]
     assert body["totals"]["gpu_hours"] == pytest.approx(3.0)
     assert [part["partition"] for part in body["totals"]["by_partition"]] == ["ckpt-all"]

@@ -87,7 +87,7 @@ def write_slurm_config(**overrides) -> Path:
     lines = [
         "backend: slurm",
         f"ssh_alias: {overrides.get('ssh_alias', 'testcluster')}",
-        f"remote_root: {overrides.get('remote_root', '/mmfs1/gscratch/mlopt/you/relay')}",
+        f"remote_root: {overrides.get('remote_root', '/mmfs1/gscratch/yourgroup/you/relay')}",
         f"remote_python: {overrides.get('remote_python', 'python3')}",
     ]
     if "requeue_on_term" in overrides:
@@ -96,7 +96,7 @@ def write_slurm_config(**overrides) -> Path:
         lines.append(f"preempt_grace: {overrides['preempt_grace']}")
     lines += [
         "slurm:",
-        f"  account: {overrides.get('account', 'mlopt')}",
+        f"  account: {overrides.get('account', 'yourgroup')}",
         f"  partition: {overrides.get('partition', 'gpu-a40')}",
     ]
     time_limit = overrides.get("time", "04:00:00")
@@ -210,7 +210,7 @@ def healthy_ssh_table() -> dict[str, doctor.SshResult]:
         "-O check": ssh_ok("Master running (pid=1234)"),
         "--version": ssh_ok("Python 3.11.9"),
         "command -v sbatch": ssh_ok("/usr/bin/sbatch"),
-        "sacctmgr": ssh_ok("mlopt\nstf\n"),
+        "sacctmgr": ssh_ok("yourgroup\nstf\n"),
         # Before the broad "scontrol" needle, which would otherwise swallow it.
         "show config": ssh_ok(KLONE_SLURM_CONFIG),
         "scontrol": ssh_ok(KLONE_PARTITION),
@@ -420,7 +420,7 @@ def test_the_remote_root_probe_survives_being_wrapped(monkeypatch):
     """
     seen = record_subprocess(monkeypatch)
     probe = doctor._REMOTE_ROOT_PROBE.format(
-        root="'/mmfs1/gscratch/mlopt/you/relay'",
+        root="'/mmfs1/gscratch/yourgroup/you/relay'",
         no_dir=doctor._NO_DIR,
         no_write=doctor._NO_WRITE,
         ok=doctor._ROOT_OK,
@@ -930,7 +930,7 @@ def test_sbatch_present_is_ok_and_missing_is_an_error(monkeypatch):
 
 
 def test_configured_account_found_in_associations(monkeypatch):
-    write_slurm_config(account="mlopt")
+    write_slurm_config(account="yourgroup")
     install_ssh(monkeypatch, healthy_ssh_table())
 
     assert by_name(doctor.run_checks())["slurm_account"].status == doctor.OK
@@ -943,7 +943,7 @@ def test_account_mismatch_warns_and_lists_what_was_found(monkeypatch):
     result = by_name(doctor.run_checks())["slurm_account"]
     assert result.status == doctor.WARN
     assert "wrong-account" in result.detail
-    assert "mlopt" in result.detail
+    assert "yourgroup" in result.detail
 
 
 def test_account_check_uses_remote_whoami_not_a_local_username(monkeypatch):
@@ -1697,11 +1697,11 @@ def test_a_configured_ssh_timeout_is_what_every_call_uses(monkeypatch):
     write_config(
         "backend: slurm\n"
         "ssh_alias: testcluster\n"
-        "remote_root: /mmfs1/gscratch/mlopt/you/relay\n"
+        "remote_root: /mmfs1/gscratch/yourgroup/you/relay\n"
         "remote_python: python3\n"
         "ssh_timeout: 90\n"
         "slurm:\n"
-        "  account: mlopt\n"
+        "  account: yourgroup\n"
         "  partition: gpu-a40\n"
         '  time: "04:00:00"\n'
     )

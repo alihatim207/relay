@@ -419,7 +419,7 @@ def test_classify_failure_tolerates_empty_stderr():
 @pytest.mark.parametrize(
     "bad",
     [
-        "ahatim@klone.hyak.uw.edu",  # the thing relay exists to avoid
+        "you@klone.hyak.uw.edu",  # the thing relay exists to avoid
         "klone hyak",  # a space would split into two ssh arguments
         "klone\t2",
         "klone\n",

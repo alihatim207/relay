@@ -15,7 +15,7 @@ stores an *SSH alias*: the name of a `Host` block in the user's own
 user's existing SSH configuration supply the user, the host, the key, the
 jump host and — on a Duo-protected cluster like Hyak, where a fresh
 authentication takes tens of seconds — the ControlMaster socket. Copying
-`ahatim@klone.hyak.uw.edu` into relay's config would duplicate configuration
+`you@klone.hyak.uw.edu` into relay's config would duplicate configuration
 that already exists, and would quietly bypass it. So `ssh_alias` containing an
 `@` is a hard validation error, not a warning.
 
@@ -454,7 +454,7 @@ PATH_PLACEHOLDER = "{path}"
 # Keys that used to exist and no longer do, mapped to a sentence telling the
 # user what to write instead. Without this, upgrading relay turns a working
 # config into a bare "unknown key" error and the user has to go and read the
-# changelog to find out what happened to their settings.
+# git history to find out what happened to their settings.
 _RENAMED_KEYS: dict[str, str] = {
     "sbatch_defaults": (
         "'sbatch_defaults' has been replaced by 'sbatch_extra', which is a list "
@@ -1048,7 +1048,7 @@ def load(path: Path | None = None) -> Config:
     if remote_root is not None and not remote_root.startswith(("/", "~")):
         raise ConfigError(
             f"remote_root is {remote_root!r} in {path}, but it must be an absolute "
-            f"path on the cluster (for example /mmfs1/gscratch/mlopt/you/relay). "
+            f"path on the cluster (for example /mmfs1/gscratch/yourgroup/you/relay). "
             f"A relative path would resolve differently depending on which "
             f"directory a job happens to start in."
         )
@@ -1276,7 +1276,7 @@ backend: local
 # directory per run. It must be visible from the compute nodes, not just from
 # the login node, because that directory is the only channel a running job has
 # back to your laptop.
-# remote_root: /mmfs1/gscratch/mlopt/you/relay
+# remote_root: /mmfs1/gscratch/yourgroup/you/relay
 
 # The Python that runs relay's sidecar on the cluster. Often a full path into
 # a module or conda environment rather than a bare name.

@@ -68,7 +68,7 @@ from relay.backends.slurm import (
 from relay.config import Config, SlurmConfig
 
 ALIAS = "klone"
-REMOTE_ROOT = "/mmfs1/gscratch/mlopt/ahatim/relay"
+REMOTE_ROOT = "/mmfs1/gscratch/yourgroup/you/relay"
 RUN_DIR = f"{REMOTE_ROOT}/vr_s1_7f3a"
 
 # Hand-written sacct output, one file per shape the parser has to survive.
@@ -261,8 +261,8 @@ def test_render_omits_account_and_partition_when_unset():
 
 
 def test_render_includes_account_and_partition_when_set():
-    script = render_sbatch(make_spec(), account="mlopt", partition="gpu-a40")
-    assert "#SBATCH --account=mlopt" in script
+    script = render_sbatch(make_spec(), account="yourgroup", partition="gpu-a40")
+    assert "#SBATCH --account=yourgroup" in script
     assert "#SBATCH --partition=gpu-a40" in script
 
 
@@ -270,14 +270,14 @@ def test_spec_account_and_partition_beat_backend_defaults():
     """A per-run choice outranks a config-file default."""
     script = render_sbatch(
         make_spec(account="other-acct", partition="ckpt"),
-        account="mlopt",
+        account="yourgroup",
         partition="gpu-a40",
     )
     assert "#SBATCH --account=other-acct" in script
     assert "#SBATCH --partition=ckpt" in script
     # The backend's defaults must not appear at all -- checked as directives,
-    # because "mlopt" also occurs inside the run directory path.
-    assert "--account=mlopt" not in script
+    # because "yourgroup" also occurs inside the run directory path.
+    assert "--account=yourgroup" not in script
     assert "--partition=gpu-a40" not in script
 
 
@@ -439,7 +439,7 @@ SAMPLE_SCRIPT = """\
 # resubmit by hand; relay rewrites it on the next submit.
 
 #SBATCH --job-name=vr_s1_7f3a
-#SBATCH --account=mlopt
+#SBATCH --account=yourgroup
 #SBATCH --partition=ckpt-all
 #SBATCH --gres=gpu:a40:1
 #SBATCH --chdir={run_dir}
@@ -488,7 +488,7 @@ def test_the_whole_rendered_script_for_a_realistic_spec():
     script = render_sbatch(
         spec,
         remote_python="/sw/py/bin/python",
-        account="mlopt",
+        account="yourgroup",
         partition="ckpt-all",
     )
     exec_line = (
@@ -765,7 +765,7 @@ def test_submit_passes_backend_config_into_the_script():
         TAR_OK,
         SUBMIT_OK,
         remote_python="/sw/py/bin/python",
-        account="mlopt",
+        account="yourgroup",
         partition="ckpt",
         grace_seconds=120,
     )
@@ -774,7 +774,7 @@ def test_submit_passes_backend_config_into_the_script():
     backend.submit(make_spec(grace_seconds=0, time_limit="04:00:00"))
 
     script = tar_contents(runner.calls[0]["input"])[SBATCH_FILENAME].decode("utf-8")
-    assert "#SBATCH --account=mlopt" in script
+    assert "#SBATCH --account=yourgroup" in script
     assert "#SBATCH --partition=ckpt" in script
     assert "#SBATCH --time=04:00:00" in script
     assert "#SBATCH --signal=B:USR1@120" in script
@@ -1006,7 +1006,7 @@ def test_submit_raises_transport_error_on_timeout():
 
 def test_constructing_with_a_user_at_host_is_refused():
     with pytest.raises(ValueError) as excinfo:
-        SlurmBackend(ssh_alias="ahatim@klone.hyak.uw.edu", remote_root=REMOTE_ROOT)
+        SlurmBackend(ssh_alias="you@klone.hyak.uw.edu", remote_root=REMOTE_ROOT)
     assert "~/.ssh/config" in str(excinfo.value)
 
 
@@ -1662,7 +1662,7 @@ def test_from_config_builds_a_backend():
         remote_root=REMOTE_ROOT,
         remote_python="/sw/py/bin/python",
         slurm=SlurmConfig(
-            account="mlopt",
+            account="yourgroup",
             partition="gpu-a40",
             time="04:00:00",
             grace_seconds=120,
@@ -1674,7 +1674,7 @@ def test_from_config_builds_a_backend():
     assert backend.ssh_alias == ALIAS
     assert backend.remote_root == REMOTE_ROOT
     assert backend.remote_python == "/sw/py/bin/python"
-    assert backend.account == "mlopt"
+    assert backend.account == "yourgroup"
     assert backend.partition == "gpu-a40"
     assert backend.grace_seconds == 120
     assert backend.runner is runner
@@ -1849,7 +1849,7 @@ def test_the_training_job_does_not_get_the_clean_shell():
     script = render_sbatch(
         spec,
         remote_python="/sw/py/bin/python",
-        account="mlopt",
+        account="yourgroup",
         partition="ckpt-all",
     )
 

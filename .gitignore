@@ -19,3 +19,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Local project instructions; not part of the published repo.
+CLAUDE.md
