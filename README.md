@@ -41,18 +41,46 @@ and `relay doctor` checks it against the cluster.
 
 ## Usage
 
+Set up once:
+
 ```sh
-relay init                 # write config
-relay connect              # open the SSH master (answer Duo once)
-relay doctor               # check everything end to end
-relay submit train.py --time 04:00:00 --seeds 0-4 -- --lr 3e-4
-relay ls                   # list runs
-relay show <run>           # run detail, attempts, usage
-relay logs <run>           # stream logs
-relay usage                # GPU-hours, CPU-hours, wasted hours
-relay dash                 # local web dashboard
-relay daemon               # start the sync daemon
+relay init                 # write a commented config to ~/.config/relay/config.yaml
+relay connect              # open the SSH master; answers Duo once, persists 8h
+relay doctor               # check config, SSH, account, partition, database, daemon
+relay daemon               # the sync loop; leave it running in its own terminal tab
 ```
+
+Then, from any directory:
+
+```sh
+relay submit train.py --time 04:00:00 -- --lr 3e-4     # one run
+relay submit train.py --seeds 0-4 -- --lr 3e-4         # one run per seed, each gets --seed N
+relay ls                   # active runs; --all includes finished ones
+relay show <run>           # attempts, resumed-from paths, usage, latest metrics
+relay logs <run>           # the script's output so far; --follow keeps printing
+relay attach <run>         # logs and metrics together as they arrive; --tail starts from now
+relay cancel <run>         # write CANCEL_REQUESTED, then scancel; the sidecar will not requeue
+relay usage                # GPU-hours, CPU-hours, partition split, wasted hours
+relay dash                 # web dashboard on 127.0.0.1; --port to change it
+```
+
+Every read command takes `--json`, and `relay ls` and `relay usage` end with
+two freshness ages, `metrics 2s ago · job state 41s ago`, so stale data is
+never presented as current.
+
+`submit` takes the script path as it exists on the cluster, and everything
+after `--` reaches the script unchanged. Account, partition, GPU, and the
+setup lines come from the config; per-run overrides are `--time`, `--name`,
+`--setup LINE`, `--sbatch-extra ENTRY` (both repeatable and each replaces the
+config's list entirely), and `--checkpoint-glob` with `--resume-arg` for
+config-driven resume. `--backend local` runs the same job on your laptop.
+
+`usage` filters with `--since DATE` and `--group ACCOUNT`, and groups with
+`--by run|group|partition`. `daemon` takes the six polling intervals as flags;
+see the last section.
+
+Exit codes: 0 ok, 1 runtime failure, 2 bad usage, 3 not configured (run
+`relay init`), 4 cannot reach the cluster (run `relay connect`), 5 no such run.
 
 Training scripts report metrics by printing a line like:
 
@@ -60,7 +88,8 @@ Training scripts report metrics by printing a line like:
 ##relay## {"step": 1000, "loss": 0.412}
 ```
 
-with `flush=True`. No import required.
+with `flush=True`. Anything else the script prints becomes a log line. No
+import required.
 
 ## Checkpointing under preemption
 
