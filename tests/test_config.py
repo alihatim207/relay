@@ -1152,7 +1152,7 @@ def test_daemon_section_defaults_when_absent():
 
     assert conf.daemon == cfg.DaemonConfig()
     assert conf.daemon.tail_interval_active == 2.0
-    assert conf.daemon.tail_interval_queued == 30.0
+    assert conf.daemon.tail_interval_queued == 15.0
     assert conf.daemon.tail_interval_idle == 60.0
     assert conf.daemon.scheduler_interval_min == 60.0
     assert conf.daemon.scheduler_interval_max == 300.0
@@ -1215,7 +1215,7 @@ def test_daemon_partial_section_keeps_the_other_defaults():
 
     assert daemon.usage_interval == 900.0
     assert daemon.tail_interval_active == 2.0
-    assert daemon.tail_interval_queued == 30.0
+    assert daemon.tail_interval_queued == 15.0
     assert daemon.tail_interval_idle == 60.0
     assert daemon.scheduler_interval_min == 60.0
     assert daemon.scheduler_interval_max == 300.0

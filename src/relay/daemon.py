@@ -93,7 +93,7 @@ STALE_AFTER_SECONDS = 300.0
 # a `tail -c +N` on GPFS, costing whatever the job has printed since last time
 # and nothing else. No other user on the cluster is affected by it.
 INTERVAL_ACTIVE = 2.0  # something is running or producing output
-INTERVAL_QUEUED = 30.0  # runs exist, but they are all waiting in the queue
+INTERVAL_QUEUED = 15.0  # runs exist, but they are all waiting in the queue
 INTERVAL_IDLE = 60.0  # nothing to watch at all
 
 # The SCHEDULER interval: how often the daemon asks `squeue` what the jobs are
@@ -188,6 +188,9 @@ class CycleStats:
     # ask" look identical from the outside and mean opposite things.
     tailed: bool = False
     scheduler_polled: bool = False
+    # Runs moved from `queued` to `running` on the strength of the event log
+    # alone, without asking the scheduler. See `_promote_on_evidence`.
+    promoted: int = 0
     # How many active runs had a job ID to ask the scheduler about. Zero means
     # there was nothing to poll, which is different from "not due yet": with
     # nothing to ask, the scheduler schedule does not exist this cycle, so it
@@ -281,9 +284,12 @@ def next_interval(stats: CycleStats) -> float:
         is down, hammering it neither fixes it nor helps anyone.
       * something is running, or bytes arrived -> 2 seconds. This is the case
         the user is watching on the dashboard.
-      * runs exist but are all queued -> 30 seconds. There is nothing being
-        written to tail while a job sits in the queue, so there is nothing to
-        gain from looking sooner.
+      * runs exist but are all queued -> 15 seconds. The tail is what notices
+        the job leaving the queue (a queued job cannot write its event log, so
+        the first bytes are proof it started -- see `_promote_on_evidence`),
+        and that is the transition a user watches for after `relay submit`.
+        Fifteen seconds is a `[ -f ]` on the shared filesystem, not a question
+        for slurmctld.
       * nothing active at all -> 60 seconds. Just enough to notice a new
         submission promptly.
     """
@@ -862,6 +868,57 @@ class Daemon:
         stats.events_parsed += len(events)
         stats.events_inserted += result["events_inserted"]
         stats.metrics_inserted += result["metrics_inserted"]
+        self._promote_on_evidence(run, events, stats)
+
+    # The event types only a live sidecar writes. `run_ended` and `signal` are
+    # deliberately absent: they prove the job *was* running, not that it is.
+    _LIVE_EVENT_TYPES = frozenset({"run_started", "heartbeat", "metric", "log", "checkpoint"})
+
+    def _promote_on_evidence(self, run: dict, events: list[dict], stats: CycleStats) -> None:
+        """A queued run that is writing its event log is running. Say so now.
+
+        The scheduler is authoritative about what the job did, and that does
+        not change here. But a job still in the queue cannot write a byte to
+        `events.jsonl`, so a fresh heartbeat or metric from a run the database
+        calls `queued` is proof, not opinion. Waiting for the next `squeue` to
+        confirm it left the user staring at QUEUED on the dashboard while the
+        loss curve was visibly moving, for as long as the scheduler backoff had
+        grown to -- up to five minutes.
+
+        This is exactly the transition a user watches for after `relay submit`,
+        and it is the one the scheduler poll is worst placed to catch, because
+        nothing had been changing while the job sat in the queue, so the poll
+        had backed off. Reading it off the tail instead makes the latency the
+        tail's queued interval, which is a filesystem check and cheap to keep
+        short, and costs slurmctld nothing.
+
+        Three guards keep it honest. Only the event types a live sidecar writes
+        count: `run_ended` proves the job *was* running, not that it is. The
+        evidence must be newer than the stale threshold, so a daemon that was
+        down for an hour and is catching up on old bytes does not promote a job
+        that has since been preempted. And `_sync_status` runs after this in
+        the same cycle, so on any cycle where the scheduler *was* asked, its
+        answer wins -- a poll that says PENDING for a requeued job overrides
+        the leftover heartbeats of the attempt that was just killed.
+
+        The scheduler backoff is reset so the next poll comes at the floor and
+        confirms what the log said.
+        """
+        if run["status"] != "queued":
+            return
+        fresh = any(
+            e.get("type") in self._LIVE_EVENT_TYPES
+            and not _older_than(e.get("ts"), self.stale_after_seconds)
+            for e in events
+        )
+        if not fresh:
+            return
+        self.store.update_run_status(run["run_id"], "running")
+        run["status"] = "running"
+        stats.status_changes += 1
+        stats.promoted += 1
+        self._scheduler_interval = self.scheduler_interval_min
+        log.info("run %s: running (the event log is live; scheduler not yet asked)", run["run_id"])
 
     # -- step 3: the scheduler owns status ---------------------------------
 

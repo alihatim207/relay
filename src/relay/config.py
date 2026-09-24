@@ -273,7 +273,7 @@ class DaemonConfig:
       twelve-hour run would make roughly twenty thousand requests nobody asked
       for.
 
-    So the tail keeps the old adaptive 2/30/60 second schedule and the
+    So the tail keeps an adaptive 2/15/60 second schedule and the
     scheduler poll gets a floor of sixty seconds that no run state can talk it
     out of, plus a backoff that stretches towards `scheduler_interval_max`
     while nothing is changing. Job state is *slow-moving* data: a queued job
@@ -285,7 +285,7 @@ class DaemonConfig:
     """
 
     tail_interval_active: float = 2.0
-    tail_interval_queued: float = 30.0
+    tail_interval_queued: float = 15.0
     tail_interval_idle: float = 60.0
     scheduler_interval_min: float = 60.0
     scheduler_interval_max: float = 300.0
@@ -1253,7 +1253,7 @@ backend: local
 # --scheduler-interval-min and so on), and a flag beats this file.
 # daemon:
 #   tail_interval_active: 2
-#   tail_interval_queued: 30
+#   tail_interval_queued: 15
 #   tail_interval_idle: 60
 #   scheduler_interval_min: 60
 #   scheduler_interval_max: 300

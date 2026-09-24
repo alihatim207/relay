@@ -1784,7 +1784,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help=(
             "how often to read the event logs while every run is still queued "
-            "and there is nothing yet to read (default 30). Overrides "
+            "and there is nothing yet to read (default 15). Overrides "
             "`daemon.tail_interval_queued` in the config."
         ),
     )

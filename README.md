@@ -240,7 +240,7 @@ is everything it runs there:
 
 | Command | How often | What it touches |
 | --- | --- | --- |
-| `tail -c +N <run>/events.jsonl`, one per active run | every 2s while a run is producing output, 30s while everything is queued, 60s when nothing is active | shared filesystem |
+| `tail -c +N <run>/events.jsonl`, one per active run | every 2s while a run is producing output, 15s while everything is queued, 60s when nothing is active | shared filesystem |
 | `squeue --me`, one call covering every run | no more often than every 60s, backing off to 5 minutes while nothing changes | slurmctld |
 | `sacct -j <ids>`, one call covering every run | every 5 minutes, plus one final reading when a run finishes, then never again for it | Slurm accounting |
 | `mkdir` and `tar -x`, then `sbatch` | two round trips, once per `relay submit` | shared filesystem, then slurmctld |

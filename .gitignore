@@ -22,3 +22,6 @@ venv/
 
 # Local project instructions; not part of the published repo.
 CLAUDE.md
+
+# graphify knowledge-graph output (local tooling, not part of the repo)
+graphify-out/

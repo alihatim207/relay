@@ -1869,7 +1869,7 @@ def test_daemon_intervals_reads_the_config_when_no_flags_were_given():
     assert values["scheduler_interval_max"] == 90
     assert values["usage_interval_seconds"] == 120
     # Untouched keys keep the config's defaults rather than disappearing.
-    assert values["interval_queued"] == 30.0
+    assert values["interval_queued"] == 15.0
     assert values["interval_idle"] == 60.0
 
 
@@ -1960,3 +1960,95 @@ def test_the_shipped_scheduler_floor_is_one_minute():
     assert daemon_module.SCHEDULER_INTERVAL_MIN == 60.0
     assert config_module.DaemonConfig().scheduler_interval_min == 60.0
     assert Daemon(Store(":memory:"), FakeBackend()).scheduler_interval_min == 60.0
+
+
+# --------------------------------------------------------------------------
+# The event log promotes a queued run to running
+# --------------------------------------------------------------------------
+
+
+def test_a_fresh_heartbeat_promotes_a_queued_run_without_asking_the_scheduler(
+    store, backend, tmp_path
+):
+    """A job that is writing its event log is not in the queue.
+
+    The transition a user watches for after `relay submit` is queued -> running,
+    and it is the one the scheduler poll is worst at: nothing changed while the
+    job waited, so the poll backed off, and the dashboard said QUEUED for
+    minutes while metrics were visibly arriving. A queued job cannot write a
+    byte, so the first fresh heartbeat is proof enough. No `squeue` needed.
+    """
+    run_id, path = seed_run(store, tmp_path, status="queued")
+    backend.statuses["1001"] = "queued"
+    clock = FakeClock()
+    daemon = Daemon(store, backend, clock=clock, **THIRTY_SECOND_FLOOR)
+
+    first = daemon.run_once()  # polls: still queued, backoff steps to 45
+    assert store.get_run(run_id)["status"] == "queued"
+    assert first.scheduler_interval == pytest.approx(45.0)
+
+    backend.append(path, line(run_id, 1, "run_started", {"attempt": 0}, ts=ts_ago(5)))
+    backend.append(path, line(run_id, 2, "heartbeat", {"last_step": 0}, ts=ts_ago(1)))
+    clock.advance(2)
+    second = daemon.run_once()  # scheduler not due; the tail alone runs
+
+    assert second.scheduler_polled is False
+    assert second.promoted == 1
+    assert second.status_changes == 1
+    assert store.get_run(run_id)["status"] == "running"
+    # ...and the scheduler is asked to confirm at the floor, not after the backoff.
+    assert daemon._scheduler_interval == pytest.approx(30.0)
+    assert second.running == 1
+
+
+def test_old_evidence_does_not_promote(store, backend, tmp_path):
+    """A daemon catching up on an hour of old bytes must not resurrect a job.
+
+    The heartbeats it is reading were written by an attempt that may since
+    have been preempted; `queued` from the last poll is the better guess until
+    the scheduler is asked again. Evidence older than the stale threshold is
+    history, not proof.
+    """
+    run_id, path = seed_run(store, tmp_path, status="queued")
+    backend.statuses["1001"] = "queued"
+    daemon = Daemon(store, backend, clock=FakeClock(), **THIRTY_SECOND_FLOOR)
+    daemon.run_once()
+
+    backend.append(path, line(run_id, 1, "heartbeat", {"last_step": 10}, ts=ts_ago(daemon.stale_after_seconds + 60)))
+    stats = daemon.run_once()
+
+    assert stats.promoted == 0
+    assert store.get_run(run_id)["status"] == "queued"
+
+
+def test_run_ended_alone_does_not_promote(store, backend, tmp_path):
+    """`run_ended` proves the job was running, not that it is."""
+    run_id, path = seed_run(store, tmp_path, status="queued")
+    backend.statuses["1001"] = "queued"
+    daemon = Daemon(store, backend, clock=FakeClock(), **THIRTY_SECOND_FLOOR)
+    daemon.run_once()
+
+    backend.append(path, line(run_id, 1, "run_ended", {"status": "interrupted", "exit_code": 143}, ts=ts_ago(1)))
+    stats = daemon.run_once()
+
+    assert stats.promoted == 0
+    assert store.get_run(run_id)["status"] == "queued"
+
+
+def test_the_scheduler_still_wins_in_a_cycle_where_it_was_asked(store, backend, tmp_path):
+    """Promotion fills the gap between polls; it never argues with one.
+
+    A requeued job is PENDING again while the killed attempt's last heartbeats
+    are still fresh on disk. On a cycle that polls, `_sync_status` runs after
+    the tail and applies the scheduler's answer over the promotion.
+    """
+    run_id, path = seed_run(store, tmp_path, status="queued")
+    backend.statuses["1001"] = "queued"
+    backend.append(path, line(run_id, 1, "heartbeat", {"last_step": 10}, ts=ts_ago(1)))
+    daemon = Daemon(store, backend, clock=FakeClock(), **THIRTY_SECOND_FLOOR)
+
+    stats = daemon.run_once()  # first cycle always polls
+
+    assert stats.scheduler_polled is True
+    assert stats.promoted == 1  # the tail did promote...
+    assert store.get_run(run_id)["status"] == "queued"  # ...and the poll put it back
